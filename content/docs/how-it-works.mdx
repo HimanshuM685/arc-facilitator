@@ -1,0 +1,115 @@
+The mechanism in full, including what we can do with your signature and what we cannot.
+
+## The sequence
+
+```
+payer                merchant                facilitator               Arc    
+  │                     │                         │                     │
+  │── GET /report ─────▶│                         │                     │
+  │◀── 402 + terms ─────│                         │                     │
+  │                     │                         │                     │
+  │ sign TransferWith-  │                         │                     │
+  │ Authorization       │                         │                     │
+  │ (offline, no gas)   │                         │                     │
+  │                     │                         │                     │
+  │── GET /report ─────▶│                         │                     │
+  │   PAYMENT-SIGNATURE │── POST /verify ────────▶│                     │
+  │                     │                         │── eth_call ────────▶│
+  │                     │◀── isValid: true ───────│                     │
+  │                     │                         │                     │
+  │                     │  (your handler runs)    │                     │
+  │                     │                         │                     │
+  │                     │── POST /settle ────────▶│                     │
+  │                     │                         │── transferWith-     │
+  │                     │                         │   Authorization ───▶│
+  │                     │                         │  (we pay the USDC)  │
+  │                     │◀── tx hash ─────────────│◀── receipt ─────────│
+  │◀── 200 + content ───│                         │                     │
+  │   PAYMENT-RESPONSE  │                         │                     │
+```
+
+Note the ordering: your handler runs between verify and settle. A request that fails inside your code does not charge the customer.
+
+## What the payer signs
+
+EIP-712 typed data against the token's own domain:
+
+```solidity
+TransferWithAuthorization(
+  address from,
+  address to,
+  uint256 value,
+  uint256 validAfter,
+  uint256 validBefore,
+  bytes32 nonce
+)
+```
+
+Every allowlisted token reports the canonical typehash — `0x7c7c6cdb…1a2267` — so this is standard EIP-3009, not a variant.
+
+The signature is a message, not a transaction. It is never broadcast by the payer, costs nothing to produce, and requires no gas token in the signing account.
+
+## What we do on `/verify`
+
+Read-only. No transaction, no gas:
+
+1. Recover the signer from the signature and confirm it equals `authorization.from`. Handles EOAs and EIP-1271 smart accounts.
+2. Confirm the payer's token balance covers `value`.
+3. Confirm `validAfter`/`validBefore` make the authorization live now, and that it satisfies the merchant's `maxTimeoutSeconds`.
+4. Confirm the asset and network match what the merchant asked for and what we allowlist.
+5. Simulate `transferWithAuthorization` to confirm it would actually succeed.
+
+This is all handled by `@x402/evm` — the official implementation, not a reimplementation of signature recovery. It is cheap enough to call freely.
+
+## What we do on `/settle`
+
+1. Re-run the checks above, including the simulation, because state can have changed since verify.
+2. Submit `transferWithAuthorization(...)` from our signer, paying the USDC fee.
+3. Wait for the receipt and return the hash.
+
+The on-chain transaction has `from` = our signer and emits a `Transfer` from the payer to the merchant. Those are two different addresses on purpose: we pay the fee, we never touch the funds.
+
+On Arc that distinction is the only thing separating the fee from the payment, because both are USDC. The payer's balance moves by the signed amount; the fee comes out of ours. Nothing in the transaction can charge the payer for gas — the gas account is whoever sent the transaction, and that is us.
+
+If the broadcast lands but the receipt wait times out, we return `settlement_pending` **with the transaction hash**. That is not a failure — the payment may well confirm. A retry for the same payload reconciles against the already-broadcast transaction rather than sending a second one.
+
+## The trust model
+
+What we are able to do with a signature you hand us:
+
+| | Possible? | Enforced by |
+| --- | --- | --- |
+| Change the amount | No | `value` is in the signed message |
+| Redirect the funds | No | `to` is in the signed message |
+| Pay ourselves | No | Same — `to` is fixed |
+| Replay it | No | Single-use `nonce`, consumed on-chain |
+| Use it after it expires | No | `validBefore`, checked on-chain |
+| Take custody of the tokens | No | They never enter our address |
+| **Decline to submit it** | **Yes** | Nothing prevents this |
+| **Learn that the payment exists** | **Yes** | We see payer, merchant, amount, resource |
+
+That last row is the real cost of using a facilitator: metadata. We see who paid whom, how much, and for which URL — and we publish it in the [transaction log](/logs). We do not store signatures or authorization nonces, because those are the only parts that would be dangerous to keep.
+
+Our blast radius if we were fully compromised is the USDC in our gas wallet. There is no pool of customer funds to lose, because there is no pool. Worth stating plainly for Arc, where the gas wallet holds the same asset customers are paying in: that balance is ours, funded by us, and it is spent on fees. A payer's funds never enter it.
+
+## Two Arc-specific failure modes
+
+**The runtime blocklist.** Arc's USDC enforces its blocklist during execution, so a transfer to or from a blocklisted address reverts — and a transaction that reverts on that check *still consumes gas*. This is why we re-simulate inside `/settle` instead of trusting what `/verify` concluded a moment earlier. It costs one `eth_call` and turns a bill into a verdict.
+
+**Silent drops.** Arc's mempool discards a transaction whose `maxFeePerGas` is below the 20 gwei minimum base fee, without an error or a receipt. We rely on viem's fee estimation, which sits above the floor, and refuse to broadcast at all when the signer is below its operating balance — a clean `503` beats a transaction that vanishes.
+
+One more thing to know if you index rather than read receipts: under EIP-7708, Arc emits a standard `Transfer` log for native USDC movements from a system emitter, in addition to the one from the token contract. A naive indexer counts one payment twice.
+
+## Why no Permit2
+
+The x402 `exact` scheme has a Permit2 path for tokens that lack EIP-3009. It needs an extra approval the payer must first grant to the Permit2 contract — which costs gas, which defeats the point unless that approval is itself sponsored.
+
+The asset we allowlist supports EIP-3009 natively, so we use the direct path and skip the problem. Permit2 is deployed on both Arc networks at the standard address if you want to build on it yourself — see [network reference](/docs/network-reference).
+
+## Where the gas actually goes
+
+A settlement costs roughly 70,000–90,000 gas. Arc's minimum base fee is 20 gwei, so one payment costs on the order of **0.0017–0.0022 USDC**. We cap each settlement at 300,000 gas — see [limits](/docs/limits).
+
+Because gas and revenue are the same asset here, that figure is directly comparable to what moved: a 0.01 USDC payment — the dust floor — spends about a fifth of its own value on gas, which is exactly why the floor sits where it does. `/api/stats` reports the ratio across all settlements as `gasRatio`.
+
+Every figure we spend is in the [log](/logs), per payment.

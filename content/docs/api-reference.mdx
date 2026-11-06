@@ -1,0 +1,310 @@
+Five endpoints. `/verify`, `/settle` and `/supported` are the x402 v2 facilitator interface, so any `@x402/*` client works against them unmodified. `/assets` and `/health` are ours.
+
+Base URL: <NetVal k="facilitatorUrl" />
+
+Both networks are served from this one URL — x402 carries the network inside the payment payload, so there is no per-network endpoint.
+
+## POST /verify
+
+Checks a payment authorization without broadcasting anything. Costs no gas; call it freely.
+
+**Request**
+
+This is exactly what `HTTPFacilitatorClient` from `@x402/core` sends; you never build it yourself when using the x402 middleware.
+
+```json
+{
+  "x402Version": 2,
+  "paymentPayload": {
+    "x402Version": 2,
+    "resource": { "url": "https://api.example.com/report" },
+    "accepted": { "...": "the PaymentRequirements this payload satisfies" },
+    "payload": {
+      "signature": "0x…",
+      "authorization": {
+        "from": "0x…",
+        "to": "0x…",
+        "value": "10000",
+        "validAfter": "1762400000",
+        "validBefore": "1762400060",
+        "nonce": "0x…"
+      }
+    }
+  },
+  "paymentRequirements": {
+    "scheme": "exact",
+    "network": "{{caip2}}",
+    "asset": "{{asset}}",
+    "amount": "10000",
+    "payTo": "0x…",
+    "maxTimeoutSeconds": 60,
+    "extra": { "name": "{{assetDomainName}}", "version": "{{assetDomainVersion}}" }
+  }
+}
+```
+
+`paymentRequirements` may be omitted, in which case `paymentPayload.accepted` is used — it carries the same object.
+
+**Response**
+
+```json
+{ "isValid": true, "payer": "0x…" }
+```
+
+```json
+{ "isValid": false, "invalidReason": "insufficient_funds", "invalidMessage": "…" }
+```
+
+## POST /settle
+
+Submits the authorization on-chain and pays the USDC fee. Same request body as `/verify`.
+
+**Response**
+
+```json
+{
+  "success": true,
+  "transaction": "0x…",
+  "network": "{{caip2}}",
+  "payer": "0x…"
+}
+```
+
+```json
+{
+  "success": false,
+  "errorReason": "settlement_pending",
+  "errorMessage": "…",
+  "transaction": "0x…",
+  "network": "{{caip2}}"
+}
+```
+
+`settlement_pending` with a non-empty `transaction` means the transaction was broadcast but we could not confirm it in time. It may still succeed — check the hash before treating the payment as failed. Retrying the same payload reconciles against that transaction rather than broadcasting a second one.
+
+## GET /supported
+
+Scheme and network discovery.
+
+```json
+{
+  "kinds": [
+    { "x402Version": 2, "scheme": "exact", "network": "eip155:5042002" }
+  ],
+  "extensions": [],
+  "signers": { "eip155:*": ["0x…"], "eip155:5042002": ["0x…"] }
+}
+```
+
+`signers` is the address that pays your gas. Only networks with at least one servable asset are listed, so mainnet is absent until it has one.
+
+## GET /assets
+
+Not part of the x402 spec. Both Arc networks *are* in `@x402/evm`'s `DEFAULT_ASSETS`, so `price: "$0.01"` resolves without this endpoint — it exists for merchants who would rather be explicit, and for checking what the library will pick. A wrong `extra` breaks every signature with no on-chain trace, so these values are computed from the token's own `DOMAIN_SEPARATOR()` and re-verified on every deploy.
+
+<NetCode lang="bash">
+{`curl -s {{facilitatorUrl}}/assets | jq`}
+</NetCode>
+
+```json
+{
+  "networks": [
+    {
+      "network": "testnet",
+      "caip2": "eip155:5042002",
+      "chainId": 5042002,
+      "assets": [
+        {
+          "symbol": "USDC",
+          "label": "USD Coin",
+          "address": "0x3600000000000000000000000000000000000000",
+          "decimals": 6,
+          "extra": { "name": "USDC", "version": "2" },
+          "domainSeparator": "0x361191522483d3…"
+        }
+      ]
+    }
+  ]
+}
+```
+
+Drop `extra` straight into your route's `price`.
+
+## GET /health
+
+Per-network operational state. Returns `200` when healthy, `503` when degraded, so it works as an uptime check.
+
+<NetCode lang="bash">
+{`curl -s {{facilitatorUrl}}/health | jq`}
+</NetCode>
+
+```json
+{
+  "status": "ok",
+  "signer": "0x…",
+  "db": "ok",
+  "networks": [
+    {
+      "network": "testnet",
+      "caip2": "eip155:5042002",
+      "status": "ok",
+      "blockNumber": "…",
+      "balanceUsdc": "…",
+      "gasPriceGwei": "25.00",
+      "estimatedSettlesLeft": 2300
+    }
+  ]
+}
+```
+
+A network's `status` can also be `disabled` — mainnet settlement switched off — in which case `/verify` still works and `/settle` returns 503.
+
+## GET /api/logs
+
+Powers the [transaction log](/logs). `network` selects the table; the two never mix.
+
+<NetCode lang="bash">
+{`curl -s '{{facilitatorUrl}}/api/logs?network={{network}}&limit=20' | jq '.rows[0]'`}
+</NetCode>
+
+| Parameter | Default | Notes |
+| --- | --- | --- |
+| `network` | `testnet` | `testnet` or `mainnet` |
+| `limit` | `50` | capped at 200 |
+| `before` | — | Opaque cursor; pass `nextBefore` from the previous page (a bare ISO timestamp is also accepted) |
+| `address` | — | matches either role — payer **or** merchant. What the log page's search box uses. |
+| `payer` | — | exact address match, case-insensitive |
+| `payTo` | — | exact address match, case-insensitive |
+
+## GET /discovery/resources
+
+The x402 Bazaar catalog, in the official `DiscoveryResourcesResponse` shape read by `withBazaar(client).extensions.bazaar.listResources()`. Only endpoints whose live `402` we verified pay the listed address. See [List your API in the Bazaar](/docs/bazaar).
+
+| Parameter | Default | |
+| --- | --- | --- |
+| `network` | — | CAIP-2, e.g. `{{caip2}}` |
+| `payTo` | — | one merchant's endpoints |
+| `type` | — | `http` (the only type listed) |
+| `limit` | `20` | up to 100 |
+| `offset` | `0` | |
+
+```json
+{
+  "x402Version": 2,
+  "items": [
+    {
+      "resource": "https://acme.example/x402/top-up",
+      "type": "http",
+      "x402Version": 2,
+      "accepts": [{ "scheme": "exact", "network": "eip155:5042002", "asset": "0x…", "amount": "10000", "payTo": "0x…" }],
+      "lastUpdated": "2026-11-06T09:12:44.120Z",
+      "serviceName": "Acme",
+      "description": "Top up a prepaid account by 0.01 USDC",
+      "tags": ["payments", "prepaid"],
+      "iconUrl": "https://acme.example/icon.png",
+      "extensions": { "bazaar": { "info": { "input": { "…": "…" }, "output": { "…": "…" } }, "schema": { "…": "…" } } }
+    }
+  ],
+  "pagination": { "limit": 20, "offset": 0, "total": 1 }
+}
+```
+
+## GET /discovery/search
+
+`?query=` text search over the same verified catalog (name, description, URL, tags). Returns the official `SearchDiscoveryResourcesResponse`: `{ x402Version, resources, partialResults }`.
+
+## POST /discovery/register
+
+A merchant's code declares its pay-to address and x402 endpoints. We call each one and list it only if its live `402` pays that address on a network we serve. Body and response: see [registering](/docs/bazaar#2-register-up-front-optional). Rate limited per IP; `429` with `Retry-After` when exceeded.
+
+## GET /api/bazaar
+
+Merchant cards behind the [Bazaar](/bazaar) page: one per pay-to address with at least one verified endpoint, up to 200, most-paid first. `?network=testnet|mainnet` filters by network. `networks` lists every network the merchant has a verified endpoint on (only the filtered one when `?network` is set).
+
+```json
+{
+  "merchants": [
+    {
+      "payTo": "0x…",
+      "name": "Acme",
+      "website": "https://acme.example",
+      "iconUrl": "https://acme.example/icon.png",
+      "networks": ["eip155:5042002"],
+      "endpointCount": 3,
+      "settleCount": 41,
+      "lastVerifiedAt": "2026-11-06T09:12:44.120Z"
+    }
+  ]
+}
+```
+
+## GET /api/bazaar/:payTo
+
+One merchant and its verified endpoints, up to 100, most-paid first. For more, page through `GET /discovery/resources?payTo=…`. Each endpoint has the same fields as a `/discovery/resources` item, plus `method`, `settleCount` and `verifiedAt`. The address may be in any letter case.
+
+| Status | When |
+| --- | --- |
+| `200` | Merchant found |
+| `400` | `:payTo` is not an address |
+| `404` | The address has no verified endpoints |
+| `503` | The catalog database is unreachable |
+
+## GET /api/stats
+
+Settlement totals per network, as shown on the front page. Computed live from the settlement log.
+
+| Parameter | Default | |
+| --- | --- | --- |
+| `range` | `all` | `24h`, `7d`, `30d` or `all` |
+
+Each network carries `current` (the window) and `previous` (the equal-length window before it, `null` for `all`):
+
+```json
+{
+  "network": "testnet",
+  "current": {
+    "settled": 412,
+    "failed": 3,
+    "onchainTxs": 414,
+    "volume": "4.12",
+    "gasSponsoredUsdc": "0.1738",
+    "gasRatio": 0.0422,
+    "uniquePayers": 37,
+    "uniqueMerchants": 5,
+    "avgSettleMs": 1840
+  },
+  "previous": { "...": "same shape" },
+  "lastSettledAt": "2026-11-06T09:12:44.120Z"
+}
+```
+
+`onchainTxs` counts every settle transaction that reached the chain, including reverted ones; `settled` counts only successful ones. `avgSettleMs` is the time from our receiving `/settle` to the confirmed receipt (simulation, broadcast and confirmation), averaged over successful settles. `volume` is in whole USDC, and `gasSponsoredUsdc` is too — on Arc gas and revenue are the same asset, so `gasRatio` is the share of settled volume spent on fees.
+
+## Error codes
+
+Protocol verdicts come back with `200` and `isValid: false` / `success: false` — the payment was judged, not the request:
+
+| Reason | Meaning |
+| --- | --- |
+| `unsupported_network` | Not an Arc CAIP-2 identifier we serve |
+| `unsupported_scheme` | Only `exact` is implemented |
+| `unsupported_asset` | Token not allowlisted on that network |
+| `amount_below_minimum` | Under 0.01 — gas would exceed the transfer |
+| `invalid_amount` | `amount` was not an integer string |
+| `insufficient_funds` | Payer's token balance too low |
+| `invalid_exact_evm_payload_signature` | Signature does not recover to `from`. Usually a wrong `extra` domain. |
+| `invalid_exact_evm_payload_authorization_valid_before` | Authorization expired |
+| `settlement_pending` | Broadcast but unconfirmed; `transaction` is populated |
+
+Operational refusals use HTTP status codes, because they are about us rather than the payment, and are worth retrying:
+
+| Status | `error` | Meaning |
+| --- | --- | --- |
+| `400` | `bad_request` | Malformed body |
+| `400` | `unsupported_network` | Network not served; checked before dispatch |
+| `429` | `rate_limited` | Over a per-IP, per-payer or per-merchant limit. `Retry-After` is set. |
+| `503` | `mainnet_disabled` | Mainnet settlement off; `/verify` unaffected. `Retry-After: 3600`. |
+| `503` | `signer_balance_low` | Our USDC is below the operating floor. `Retry-After: 300`. |
+| `503` | `signer_unavailable` | Signer key or RPC unavailable. `Retry-After: 30`. |
+
+Nothing is ever broadcast on a `429` or `503`, so these cost you nothing but a retry.

@@ -1,0 +1,129 @@
+You have a script or an agent that needs to call a paid endpoint. It holds USDC. It needs **no gas balance** — and on Arc there is no separate gas token for it to need, because gas is USDC too. It signs; we send.
+
+You are reading the <NetVal k="networkName" mono={false} /> version of this page.
+
+## 1. Install
+
+<NetCode lang="bash">
+{`npm install @x402/fetch @x402/evm viem`}
+</NetCode>
+
+## 2. Wrap fetch
+
+<NetCode filename="agent.ts">
+{`import { wrapFetchWithPaymentFromConfig, decodePaymentResponseHeader } from "@x402/fetch";
+import { ExactEvmScheme } from "@x402/evm/exact/client";
+import { privateKeyToAccount } from "viem/accounts";
+
+const account = privateKeyToAccount(process.env.AGENT_PRIVATE_KEY as \`0x\${string}\`);
+
+const fetchWithPayment = wrapFetchWithPaymentFromConfig(fetch, {
+  schemes: [{ network: "{{caip2}}", client: new ExactEvmScheme(account) }],
+  spendControls: {
+    allowedAssets: [
+      { network: "{{caip2}}", asset: "{{asset}}", maxAmountPerPayment: "50000" }, // 0.05 USDC
+    ],
+  },
+});
+
+const response = await fetchWithPayment("https://api.example.com/report");
+console.log(await response.json());
+
+// The settlement, including the transaction hash:
+const paymentResponse = response.headers.get("PAYMENT-RESPONSE");
+if (paymentResponse) console.log(decodePaymentResponseHeader(paymentResponse));`}
+</NetCode>
+
+That is it. The wrapped fetch makes the request, sees the 402, signs an authorization matching the terms, and retries with a `PAYMENT-SIGNATURE` header. Your code sees one `await` and a 200.
+
+Already paying on other chains? Add their schemes to the same `schemes` array (or use `network: "eip155:*"` for every EVM chain). Nothing else changes.
+
+### Why `allowedAssets` is required
+
+The x402 client has built-in spend controls: by default it only signs for tokens in its own list of well-known assets, capped at $1. Arc USDC *is* in that list, so a payment up to $1 works without any config — but the default cap is the thing that bites, and an agent should set its own:
+
+```
+All payment requirements were rejected by spendControls: only default assets or entries in spendControls.allowedAssets are allowed.
+```
+
+The `allowedAssets` entry above sets an explicit cap in base units (`50000` = 0.05 USDC) and replaces the $1 default. Keep a cap: an agent with an unbounded signer and a tool that fetches arbitrary URLs is a bad combination. `spendControls: false` also works, and removes every limit — do not.
+
+### Finding endpoints to call
+
+Don't have a URL yet? The [Bazaar](/bazaar) lists every verified x402 endpoint paid through this facilitator, and an agent can read it with `withBazaar(...).extensions.bazaar.listResources()`: all of them, one merchant's (`payTo`), or by keyword. See [discover a merchant's endpoints](/docs/bazaar#3-discover-a-merchants-endpoints).
+
+## 3. Fund the agent — with the token only
+
+The account needs a balance of the asset it will pay in. That is all.
+
+<div className="not-prose">
+  <div className="glass px-4 py-2">
+    <NetField label="Pay with" k="assetSymbol" />
+    <NetField label="Token address" k="asset" />
+    <NetField label="Chain ID" k="chainId" />
+  </div>
+  <p className="mt-2 text-xs text-chalk-dim">Gas paid by the agent: none.</p>
+</div>
+
+<OnlyOn network="testnet">
+Get test tokens: see [testnet setup](/docs/quickstart-testnet).
+</OnlyOn>
+
+<OnlyOn network="mainnet">
+Mainnet settles the same way, behind a switch: see [mainnet](/docs/quickstart-mainnet).
+</OnlyOn>
+
+Then confirm the agent paid nothing but the price. Read both views of its balance before and after: the native (18-decimal) figure must fall by exactly the authorized amount scaled by 10^12, and by nothing else. That equality is the proof the flow works — not a zero balance, which is not a state a paying account on Arc can be in.
+
+<NetCode lang="bash">
+{`# 18 decimals: the native view, where gas would be deducted
+cast balance $AGENT_ADDRESS --rpc-url {{rpc}}
+# 6 decimals: the ERC-20 view, where the payment amount is denominated
+cast call {{asset}} "balanceOf(address)(uint256)" $AGENT_ADDRESS --rpc-url {{rpc}}`}
+</NetCode>
+
+## What the agent actually signs
+
+Worth knowing, because you are authorising a token movement with a key:
+
+```ts
+// EIP-712 typed data, signed offline. Never broadcast by the agent.
+{
+  domain: { name: "…", version: "…", chainId: {{chainId}}, verifyingContract: "{{asset}}" },
+  primaryType: "TransferWithAuthorization",
+  message: {
+    from: agentAddress,
+    to: merchantAddress,   // fixed by the signature
+    value: "10000",        // fixed by the signature
+    validAfter, validBefore,
+    nonce: randomBytes32,  // single use, enforced on-chain
+  },
+}
+```
+
+The recipient and the amount are inside the signed message, so the facilitator cannot alter either. The nonce is consumed on-chain, so the signature cannot be replayed. The validity window bounds how long it is live. The only discretion we have is whether to submit it.
+
+## Paying by hand
+
+If you are implementing a client rather than using one, decode the 402 to see the terms:
+
+<NetCode lang="bash">
+{`curl -si https://api.example.com/report \\
+  | grep -i '^payment-required:' \\
+  | cut -d' ' -f2 | base64 -d | jq`}
+</NetCode>
+
+You will get the `accepts` array. Pick an entry whose `network` and `asset` you can satisfy, sign the typed data above using that entry's `extra` as the domain `name`/`version`, and send it back base64-encoded in the `PAYMENT-SIGNATURE` header. The full field-by-field shape is in the [API reference](/docs/api-reference).
+
+## When it does not work
+
+| Symptom | Cause |
+| --- | --- |
+| `invalid_exact_evm_payload_signature` | The domain you signed under does not match the token. Almost always a wrong `extra.name` or `extra.version` from the merchant. |
+| `insufficient_funds` | The agent does not hold enough USDC. Check `balanceOf` at 6 decimals, not the 18-decimal native balance — they are the same money written two ways. |
+| `unsupported_asset` | The merchant priced the route in a token we do not sponsor on that network. |
+| `amount_below_minimum` | Under 0.01 — gas would cost more than the payment. |
+| `429` | Rate limited. Back off for the `Retry-After` interval; nothing was broadcast. |
+| `503` with `signer_balance_low` | Our gas wallet needs topping up. Retry later. |
+| `rejected by spendControls` | The payment exceeds the client's default $1 cap. Add the `allowedAssets` entry shown above with your own limit. |
+| Authorization expired | `maxTimeoutSeconds` elapsed between signing and settling. Sign and submit promptly. |

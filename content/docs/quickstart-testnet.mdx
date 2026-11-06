@@ -1,0 +1,99 @@
+Arc Testnet is chain `5042002`. Tokens on it have no value. This is where you build.
+
+## What you need, and what you do not
+
+| | Needed? | Why |
+| --- | --- | --- |
+| Testnet USDC for the payer | **Yes** | It is what gets transferred. |
+| A gas balance for the payer | **No** | That is the entire point — and on Arc there is no separate gas token to need. |
+| Testnet USDC for you, the developer | Only to deploy contracts or send ordinary transactions | Paying for an API needs none. |
+
+Note what the middle row does *not* say. On a chain where gas is a separate token you would leave the payer's gas balance at zero and point at it as proof. On Arc gas is USDC, so the payer necessarily holds it — they just never spend any. If you find yourself topping up a balance to make a payment work, something is wrong with the setup, not the balance.
+
+## 1. Network details
+
+<div className="not-prose">
+  <div className="glass px-4 py-2">
+    <NetField label="Chain ID" k="chainId" />
+    <NetField label="RPC" k="rpc" />
+    <NetField label="WebSocket" k="wsRpc" />
+    <NetField label="Explorer" k="explorer" />
+    <NetField label="Faucet" k="faucet" />
+    <NetField label="Bridge" k="bridge" />
+    <NetField label="USDC" k="usdc" />
+  </div>
+</div>
+
+Add it to a wallet, or to viem — which ships Arc, so there is nothing to define:
+
+```ts
+import { arcTestnet } from "viem/chains";
+```
+
+## 2. Get testnet USDC
+
+The [Circle faucet]({{faucet}}) hands out testnet USDC. Pick **Arc Testnet** as the network. The same USDC is both the thing you will pay with and the thing that pays for gas, so one faucet request covers everything.
+
+For mainnet, or to move USDC across chains, use [Circle's USDC Bridge]({{bridge}}) or CCTP.
+
+Check what landed:
+
+<NetCode lang="bash">
+{`# The ERC-20 interface — 6 decimals, what a payment amount is denominated in
+cast call {{usdc}} "balanceOf(address)(uint256)" $AGENT --rpc-url {{rpc}}
+cast call {{usdc}} "decimals()(uint8)" --rpc-url {{rpc}}   # 6
+
+# The native interface — 18 decimals, the same balance, what gas comes out of
+cast balance $AGENT --rpc-url {{rpc}}`}
+</NetCode>
+
+Those two numbers describe one balance and differ by a factor of 10<sup>12</sup>. If that is surprising, read [supported assets](/docs/supported-assets) before you write any accounting code.
+
+## 3. Confirm the token really is EIP-3009
+
+Worth doing once for any token you plan to accept, because a token without it cannot be paid gaslessly at all:
+
+<NetCode lang="bash">
+{`# Must return the canonical typehash:
+# 0x7c7c6cdb67a18743f49ec6fa9b35f50d52ed05cbed4cc592e13b44501c1a2267
+cast call {{usdc}} "TRANSFER_WITH_AUTHORIZATION_TYPEHASH()(bytes32)" --rpc-url {{rpc}}`}
+</NetCode>
+
+If that call reverts, the token has no EIP-3009 support and belongs on the Permit2 path instead — which costs the payer an approval, so it is not gasless unless that approval is sponsored too. Arc's USDC returns the typehash on both networks.
+
+## 4. Run the whole loop
+
+Price a route, then pay it:
+
+<NetCode lang="bash">
+{`# Terminal 1 — your merchant server from the merchant quickstart
+npm run dev
+
+# Terminal 2 — unpaid request shows the terms
+curl -i http://localhost:3000/api/report
+
+# Terminal 3 — an agent that will not spend a unit on gas pays it
+npx tsx agent.ts`}
+</NetCode>
+
+Then prove it to yourself on the explorer. Open the settlement hash and check three things:
+
+1. The USDC `Transfer` event goes **payer → merchant**. Not through us.
+2. The transaction's `from` is **our facilitator signer**, and the fee came out of our balance.
+3. The payer's balance fell by the payment amount and nothing else.
+
+That last one is the Arc-specific version of the claim, and the only one that actually proves gas was sponsored here. The [test page](/test) computes it for you from both views of your balance, and `pnpm smoke` asserts it.
+
+> Arc also emits a standard `Transfer` log for native USDC movements (EIP-7708), from a system emitter as well as from the token contract. If you are indexing logs rather than reading receipts, be careful not to count a single payment twice.
+
+## 5. Check our testnet status
+
+<NetCode lang="bash">
+{`curl -s {{facilitatorUrl}}/health | jq '.networks[] | select(.network=="testnet")'`}
+</NetCode>
+
+You get our signer's USDC balance, the current gas price (which should never read below Arc's 20 gwei floor) and an estimate of how many settlements are left — see [limits](/docs/limits).
+
+## Ready for real money
+
+[Mainnet setup](/docs/quickstart-mainnet). Switching networks is one string in your config.

@@ -1,0 +1,42 @@
+This is an [x402](https://docs.x402.org) v2 facilitator for [Arc](https://docs.arc.io), Circle's Layer-1 for stablecoin finance. It lets your HTTP endpoint charge per request, and it pays the gas so your customer does not have to.
+
+Concretely: a payer who holds nothing but USDC can pay your API. No faucet, no "approve first" step, no wallet popup — just a signature their wallet or agent produces offline.
+
+Arc makes that claim sharper than most chains, because on Arc **gas is USDC**. There is no second token to acquire first, and no second token for us to pay in either. The payer's USDC moves by exactly the amount they signed for; our USDC covers the fee.
+
+## The one-paragraph version
+
+Your endpoint answers an unpaid request with `402 Payment Required` and the terms. The payer signs an EIP-3009 `TransferWithAuthorization` — a message, not a transaction, so it costs nothing and needs no balance to send. Your server hands that signature to this facilitator, which checks it and then submits `transferWithAuthorization` on-chain, paying the fee from our own wallet. The USDC moves **directly from payer to you**. We never hold it.
+
+## What you get
+
+- **Both networks from one URL.** Arc mainnet (`eip155:5042`) and Arc Testnet (`eip155:5042002`). x402 carries the network inside the payment payload, so there is no second endpoint to configure. Use the toggle in the header to switch which network these docs describe.
+- **USDC on both.** Unlike most chains, there is no testnet-only story here: the same `0x3600…` predeploy serves both networks, implements EIP-3009, and is allowlisted on both. See [supported assets](/docs/supported-assets).
+- **Verified EIP-712 domains.** Arc ships in the x402 SDK's default asset table, so `price: "$0.01"` resolves on its own — but if you would rather be explicit, we publish `asset`, `amount` and `extra` values proven against the token's own `DOMAIN_SEPARATOR()` and serve them from [/assets](/assets).
+- **A public log.** Every settlement, with the explorer link and the USDC we spent on it: [transaction log](/logs). Because gas and revenue are the same asset on Arc, that log tells you our cost of goods directly.
+- **Standard clients.** `@x402/express`, `@x402/hono`, `@x402/next`, `@x402/fetch`, `@x402/axios` all work unmodified.
+
+## Check it is up
+
+<NetCode lang="bash">
+{`curl -s {{facilitatorUrl}}/supported | jq
+curl -s {{facilitatorUrl}}/assets   | jq
+curl -s {{facilitatorUrl}}/health   | jq`}
+</NetCode>
+
+`/supported` tells you which networks are live and which address pays your gas. `/assets` gives you the exact `accepts` config to paste into your route.
+
+## Where to go next
+
+- Never seen x402 before → [what is x402](/docs/what-is-x402)
+- You have an API and want to charge for it → [charge for an endpoint](/docs/quickstart-merchant)
+- You have an agent that needs to pay → [pay for an endpoint](/docs/quickstart-agent)
+- You want to know exactly what we can do with your signature → [how it works](/docs/how-it-works)
+
+## Honest limitations
+
+- The `exact` scheme only, settled via EIP-3009. No Permit2 path, because the asset we allowlist supports EIP-3009 natively.
+- Allowlisted assets only. A relayer that sponsors any token it is handed is a free gas faucet for spam.
+- Mainnet settlement ships switched off and has to be deliberately enabled. See [limits](/docs/limits).
+- Rate limits per IP, payer and merchant. See [limits](/docs/limits).
+- Single instance: rate-limit counters live in process memory.

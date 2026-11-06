@@ -1,0 +1,94 @@
+We settle via EIP-3009 `transferWithAuthorization`. A token without it cannot be paid gaslessly at all — so support is not a policy choice, it is a property of the contract.
+
+On top of that, assets are **allowlisted** rather than auto-detected. A relayer that sponsors gas for any token it is handed is a free gas faucet for whoever notices first.
+
+## The list
+
+**USDC is the only stablecoin served**, on both networks. It is also what we pay gas in, because on Arc those are the same asset.
+
+| Token | Network | Address | EIP-3009 | Decimals |
+| --- | --- | --- | --- | --- |
+| **USDC** | Arc mainnet | `0x3600000000000000000000000000000000000000` | yes | 6 |
+| **USDC** | Arc Testnet | `0x3600000000000000000000000000000000000000` | yes | 6 |
+
+Yes, that is the same address twice. Arc's USDC is not a deployed token contract but a predeploy: the optional ERC-20 interface onto the chain's native USDC balance. There is no wrapped USDC on Arc and no second address to confuse it with.
+
+Fetch the same list, with verified EIP-712 domains, from [/assets](/assets).
+
+## One balance, two interfaces
+
+This is the Arc-specific thing to get right, and it is the source of most integration bugs on this chain.
+
+| Interface | Decimals | Read with | Used for |
+| --- | --- | --- | --- |
+| Native | 18 | `eth_getBalance` | gas deduction, `msg.value` |
+| ERC-20 | 6 | `balanceOf` on `0x3600…` | payment `amount`, transfers, allowances |
+
+They are **the same money**, related by a factor of 10<sup>12</sup>. A payment `amount` of `"10000"` is 0.01 USDC and corresponds to `10000000000000000` native units.
+
+Two consequences worth internalising:
+
+- **Never compare the two raw.** They differ by a trillion. Mixing `msg.value` with `balanceOf()` in the same expression is the canonical Arc bug.
+- **A zero `balanceOf` does not mean a zero balance.** The ERC-20 view truncates fractional amounts below one unit at 6 decimals; the USDC is still there natively. Credit and record balances from the 18-decimal view, or you will record less than was transferred.
+
+For payments, stay on the ERC-20 interface: amounts, prices and `decimals()` all live there. The native view matters only when you are reasoning about gas — which is what [/health](/health) reports and what `pnpm smoke` asserts against.
+
+## The `extra` values — use these exactly
+
+Arc ships in the x402 SDK's default asset table, so `price: "$0.01"` resolves without this. If you supply `extra` yourself, supply it correctly: the payer's wallet signs under the EIP-712 domain the merchant advertises, and if `name` or `version` is wrong by a character the signature recovers to a different address and verification fails with no transaction and no revert to look at.
+
+| Token | `extra` |
+| --- | --- |
+| USDC (both networks) | `{ "name": "USDC", "version": "2" }` |
+
+Note the name is the bare ticker `"USDC"`, not `"USD Coin"` — Circle's `FiatToken` signs with the symbol. These are not guesses from `name()`; each is the pair that reproduces the token's own `DOMAIN_SEPARATOR()`, checked on every deploy by `pnpm verify-assets`:
+
+```
+Arc Testnet  USDC  0x3600000000000000000000000000000000000000
+  decimals        ok
+  eip-3009        ok (canonical typehash)
+  separator       0x361191522483d32a83e70ae7183b4b9629442c13a78bc9921d6f707911c8c6b0
+  domain          ok  { name: "USDC", version: "2" }
+
+Arc  USDC  0x3600000000000000000000000000000000000000
+  decimals        ok
+  eip-3009        ok (canonical typehash)
+  separator       0x940506929bba468048a19b567f4f0d534714bc06604b5c3017e5d16785ccdf84
+  domain          ok  { name: "USDC", version: "2" }
+```
+
+The separators differ even though the address and domain do not, because `chainId` is part of the EIP-712 domain. That is also what binds a signature to one network.
+
+Check it yourself:
+
+<NetCode lang="bash">
+{`cast call {{usdc}} "TRANSFER_WITH_AUTHORIZATION_TYPEHASH()(bytes32)" --rpc-url {{rpc}}
+# 0x7c7c6cdb67a18743f49ec6fa9b35f50d52ed05cbed4cc592e13b44501c1a2267
+
+cast call {{usdc}} "DOMAIN_SEPARATOR()(bytes32)" --rpc-url {{rpc}}
+cast call {{usdc}} "name()(string)"    --rpc-url {{rpc}}   # USDC
+cast call {{usdc}} "version()(string)" --rpc-url {{rpc}}   # 2
+cast call {{usdc}} "decimals()(uint8)" --rpc-url {{rpc}}   # 6`}
+</NetCode>
+
+## What we do not serve
+
+**EURC** is live on Arc, uses the same `FiatToken` implementation, returns the canonical EIP-3009 typehash and signs under `{ name: "EURC", version: "2" }` — so it would work. It is not allowlisted here because this facilitator serves one asset deliberately. If you need it, [run your own instance](/docs/self-host): it is one entry in `lib/networks.ts`.
+
+**USYC** is permissioned and allowlist-gated, so it is not a candidate for an open relayer.
+
+**Anything via Permit2.** Permit2 is deployed on Arc at the standard address, and the x402 spec supports it as the universal fallback for tokens without EIP-3009. We do not use that path: it needs a one-time on-chain approval which costs the payer gas, which defeats the point unless the approval is itself sponsored. USDC does not need it.
+
+## Adding an asset
+
+A candidate needs to:
+
+1. Return the canonical typehash from `TRANSFER_WITH_AUTHORIZATION_TYPEHASH()`.
+2. Have a resolvable EIP-712 domain — some `name`/`version` pair must reproduce its `DOMAIN_SEPARATOR()`.
+3. Actually be held by someone, so sponsoring it is worth the gas.
+
+If you are running [your own instance](/docs/self-host), add it to `lib/networks.ts` and run `pnpm verify-assets` — it fails loudly rather than letting a wrong domain reach production.
+
+## Decimals
+
+The allowlisted asset uses 6 decimals through its ERC-20 interface, so `amount: "10000"` is `0.01` throughout. Do not assume 18 — that is the native view, a different number for the same money — and do not assume 6 stays 6 forever. Read `decimals()` or [/assets](/assets) if you are generating prices programmatically.

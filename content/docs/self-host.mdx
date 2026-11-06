@@ -1,0 +1,99 @@
+The hosted instance is free and best-effort. If you need guaranteed capacity, your own asset allowlist, or you simply do not want a third party seeing your payment metadata, run it yourself. It is one Next.js app and a Postgres database.
+
+Your merchants' configuration changes by exactly one string — the facilitator URL.
+
+## What you need
+
+- Node 22+
+- A Postgres database. [Neon](https://neon.tech) works well and the free tier is plenty.
+- A wallet funded with USDC on whichever networks you enable. On Arc, USDC *is* the gas token, so funding the signer means sending it USDC — from [faucet.circle.com](https://faucet.circle.com) on testnet. **This key signs transactions — treat it as a hot wallet.**
+
+## Setup
+
+```bash
+git clone <this repo> && cd arc-facilitator
+pnpm install
+cp .env.example .env     # then fill it in
+pnpm verify-assets       # proves the asset registry against the chains
+pnpm migrate             # optional: the app creates its tables on first use
+pnpm dev
+```
+
+Run `verify-assets` before anything else. It checks every allowlisted token's EIP-3009 typehash, decimals, and — the one that silently breaks everything — the EIP-712 domain, against the token's own `DOMAIN_SEPARATOR()`. It exits non-zero on a mismatch and prints the correct values. If it fails, nothing downstream is trustworthy.
+
+## Environment
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `FACILITATOR_PRIVATE_KEY` | **required** | Pays gas. Never logged, never returned. |
+| `DATABASE_URL` | **required** | Postgres connection string. |
+| `MAINNET_ENABLED` | `false` | Must be `true` to settle on chain 5042. Leave off until funded and verified — mainnet USDC genuinely settles, so this switch is the only thing holding it. |
+| `RPC_URL_TESTNET` | public RPC | Use a dedicated endpoint under load. |
+| `RPC_URL_MAINNET` | public RPC | Same. |
+| `NEXT_PUBLIC_FACILITATOR_URL` | `http://localhost:3000` | Your public origin. Appears in the docs' snippets. |
+| `NEXT_PUBLIC_DEFAULT_NETWORK` | `testnet` | Which network the site opens on. |
+| `MIN_AMOUNT_BASE_UNITS` | `10000` | Dust floor, 0.01 at 6 decimals. |
+| `MAX_SETTLE_GAS` | `300000` | Per-settlement ceiling. |
+| `MIN_SIGNER_BALANCE_USDC` | `0.05` | USDC, read from the signer's native (18-decimal) balance. Below this, `/settle` returns 503 instead of broadcasting. |
+| `RATE_LIMIT_IP_PER_MIN` | `120` | |
+| `RATE_LIMIT_PAYER_PER_MIN` | `30` | |
+| `RATE_LIMIT_PAYTO_PER_MIN` | `120` | |
+| `RATE_LIMIT_GLOBAL_PER_MIN` | `1200` | |
+
+## Changing the allowlist
+
+`lib/networks.ts` is the only place addresses live — the guards, the viem clients, the docs components and the `/assets` endpoint all read from it. Add an asset there, then:
+
+```bash
+pnpm verify-assets
+```
+
+A candidate token must return the canonical EIP-3009 typehash and have a resolvable EIP-712 domain. The script searches candidate `name`/`version` pairs and tells you which one the contract actually signs with, so you never have to guess. See [supported assets](/docs/supported-assets).
+
+## Deploying
+
+Two things to know about topology, because they affect what the guards actually guarantee:
+
+- **Rate-limit counters are per process.** Each instance enforces its own share, so N instances means roughly N times the configured limit.
+
+### A long-lived process — Railway, Fly, a VM
+
+`pnpm build && pnpm start` behind a reverse proxy. One instance means the rate limits are exactly what you configured. This is the deployment the defaults assume.
+
+### Vercel and other serverless platforms
+
+Works, with one caveat. Add a `vercel.json` so the framework is detected:
+
+```json
+{ "framework": "nextjs" }
+```
+
+Set `FACILITATOR_PRIVATE_KEY`, `DATABASE_URL`, `MAINNET_ENABLED` and both `NEXT_PUBLIC_*` variables in the project's environment. The `NEXT_PUBLIC_*` ones are inlined at build time, so changing them needs a redeploy. `@neondatabase/serverless` talks to Postgres over HTTP, so no connection pooling to arrange.
+
+The caveat: concurrent lambdas each keep their own rate-limit counters, so **per-IP limits are much looser than configured**. There is no gas budget, so spend is capped only by the signer's USDC balance — fund it with what you are willing to lose. If you need real per-IP limiting on serverless, move the token buckets in `lib/guards.ts` to a Postgres counter.
+
+### Client IP
+
+Rate limiting buckets on the client IP, which is only as trustworthy as the header it comes from. `clientIp()` prefers `x-vercel-forwarded-for`, `cf-connecting-ip` and `x-real-ip` — all written by the platform and not forgeable past the edge — and falls back to `x-forwarded-for` only if none are present. Behind your own proxy, make sure it rewrites `x-forwarded-for` rather than appending to whatever the caller sent.
+
+Per-payer and per-merchant limits are unaffected by any of this: those addresses come from the signed payload, not a header.
+
+## Operating it
+
+- Watch `/health`. It returns `503` when degraded, so it drops straight into an uptime check.
+- Watch the signer's USDC balance. `estimatedSettlesLeft` in `/health` tells you how many payments you can still cover.
+- Run `pnpm verify-assets` on deploy. It proves each registry asset's EIP-712 domain against the chain, and a wrong domain fails every signature with nothing on-chain to debug.
+- The signer address is public in `/supported`. Anyone can audit your gas spending on the explorer — including you.
+
+## Security notes
+
+- The private key only ever pays gas. It cannot move customer funds: an `exact` payment is one transfer signed by the payer, with recipient and amount fixed in the signature. Worst case per request is one capped transaction.
+- Signatures and authorization nonces are never written to the database. Only the metadata the log page shows.
+- Error responses do not echo RPC URLs, which may carry API keys.
+- Keep the allowlist tight. An open-asset relayer is a gas faucet, and that is the actual attack here — not fund theft.
+
+## Running without the website
+
+The facilitator endpoints are plain route handlers in `app/(facilitator)/` — a route group, so they serve at the bare origin: `/verify`, `/settle`, `/supported`, `/assets`, `/health`.
+
+If you only want the API, delete `app/page.tsx`, `app/globals.css`, `app/docs`, `app/logs`, `app/test`, `app/api`, `components/`, `content/`, `mdx-components.tsx` and `lib/docs-nav.ts`, then reduce `app/layout.tsx` to a bare `<html><body>{children}</body></html>`. The x402 endpoints in `app/(facilitator)/` keep working unchanged.
