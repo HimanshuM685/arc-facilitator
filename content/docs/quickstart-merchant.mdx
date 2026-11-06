@@ -1,0 +1,239 @@
+You have an endpoint. You want it to cost 0.01 USDC per call, settled on Arc, with the payer never spending anything on gas.
+
+You use the **standard x402 packages, unmodified**. Nothing here is specific to us except one URL: you point the official `HTTPFacilitatorClient` at this facilitator. Every other chain you already accept keeps working the usual way.
+
+You are reading the <NetVal k="networkName" mono={false} /> version of this page — the snippets below already carry that network's addresses.
+
+## 1. Install
+
+<NetCode lang="bash">
+{`npm install @x402/core @x402/evm @x402/express`}
+</NetCode>
+
+Use `@x402/hono` or `@x402/next` instead of `@x402/express` for those frameworks. `@x402/core` and `@x402/evm` are always needed.
+
+## 2. Price the route (Express)
+
+<NetCode filename="server.ts">
+{`import express from "express";
+import { paymentMiddleware, x402ResourceServer } from "@x402/express";
+import { HTTPFacilitatorClient } from "@x402/core/server";
+import { ExactEvmScheme } from "@x402/evm/exact/server";
+
+const app = express();
+
+const facilitatorClient = new HTTPFacilitatorClient({ url: "{{facilitatorUrl}}" });
+const resourceServer = new x402ResourceServer(facilitatorClient)
+  .register("{{caip2}}", new ExactEvmScheme());
+
+app.use(
+  paymentMiddleware(
+    {
+      "GET /api/report": {
+        accepts: {
+          scheme: "exact",
+          network: "{{caip2}}",
+          payTo: "0xYourMerchantAddress",
+          price: {
+            asset: "{{asset}}",
+            amount: "10000",
+            extra: { name: "{{assetDomainName}}", version: "{{assetDomainVersion}}" },
+          },
+          maxTimeoutSeconds: 60,
+        },
+        description: "One generated report",
+      },
+    },
+    resourceServer,
+  ),
+);
+
+app.get("/api/report", (_req, res) => {
+  res.json({ report: "the paid content" });
+});
+
+app.listen(3000);`}
+</NetCode>
+
+That is the whole integration. Unpaid requests get a `402` with your terms in the `PAYMENT-REQUIRED` header; paid requests carry a `PAYMENT-SIGNATURE` header, reach your handler, and are settled after it returns a success. The response carries the transaction in `PAYMENT-RESPONSE`.
+
+On startup the middleware calls our `/supported` to confirm the network is served. If the facilitator URL is wrong you find out then, not on the first paid request.
+
+## The short price form, and when to skip it
+
+Most x402 examples show `price: "$0.01"`, which works by looking the chain up in `@x402/evm`'s `DEFAULT_ASSETS` table to find a canonical stablecoin. **Both Arc networks are in that table**, mapped to USDC at `0x3600…` with 6 decimals and the `{ name: "USDC", version: "2" }` domain. So the shorthand resolves and this is a complete route config:
+
+<NetCode lang="ts">
+{`"GET /api/report": {
+  accepts: [{ scheme: "exact", network: "{{caip2}}", payTo: MERCHANT, price: "$0.01" }],
+}`}
+</NetCode>
+
+The snippets on this page use the longhand instead, for two reasons: it is explicit about what is being charged, and it is what you will need the moment you accept an asset the table does not cover. If you use it, you are supplying the three fields the shorthand would have filled in:
+
+| Field | What it is | Getting it wrong |
+| --- | --- | --- |
+| `asset` | Token contract address | Payment rejected as a non-allowlisted asset. Loud and obvious. |
+| `amount` | Base units of the **ERC-20 interface** — 6 decimals, so `10000` is 0.01 | You charge 1000× too much or too little. Do not use the 18-decimal native figure here. |
+| `extra` | The token's **EIP-712 domain** | **Every signature fails verification**, with nothing on-chain to debug. |
+
+That third row is the one that costs people an afternoon. The payer's wallet builds its signature under the domain you advertise; if the `name` or `version` is off by a character, the recovered signer is a different address and verification fails with `invalid_exact_evm_payload_signature`. There is no transaction, no revert, no log — just a payment that never works.
+
+On Arc the trap is specific: the domain name is the bare ticker `"USDC"`, not `"USD Coin"`. Circle's `FiatToken` signs with the symbol, and the longer form is the one people reach for.
+
+So do not guess them. The values above are computed from the token's own `DOMAIN_SEPARATOR()` and re-checked on every deploy. You can also fetch them at runtime from [/assets](/assets):
+
+<NetCode lang="bash">
+{`curl -s {{facilitatorUrl}}/assets | jq '.networks[] | select(.network=="{{network}}") | .assets'`}
+</NetCode>
+
+## Hono
+
+Same resource server, same route config; only the import changes.
+
+<NetCode filename="server.ts">
+{`import { Hono } from "hono";
+import { serve } from "@hono/node-server";
+import { paymentMiddleware, x402ResourceServer } from "@x402/hono";
+import { HTTPFacilitatorClient } from "@x402/core/server";
+import { ExactEvmScheme } from "@x402/evm/exact/server";
+
+const app = new Hono();
+
+const facilitatorClient = new HTTPFacilitatorClient({ url: "{{facilitatorUrl}}" });
+const resourceServer = new x402ResourceServer(facilitatorClient)
+  .register("{{caip2}}", new ExactEvmScheme());
+
+app.use(
+  paymentMiddleware(
+    {
+      "GET /api/report": {
+        accepts: {
+          scheme: "exact",
+          network: "{{caip2}}",
+          payTo: "0xYourMerchantAddress",
+          price: {
+            asset: "{{asset}}",
+            amount: "10000",
+            extra: { name: "{{assetDomainName}}", version: "{{assetDomainVersion}}" },
+          },
+        },
+        description: "One generated report",
+      },
+    },
+    resourceServer,
+  ),
+);
+
+app.get("/api/report", (c) => c.json({ report: "the paid content" }));
+
+serve({ fetch: app.fetch, port: 3000 });`}
+</NetCode>
+
+## Next.js
+
+API routes use `withX402`. It settles only after your handler returns a status below 400, so a request that fails inside your code does not charge the customer.
+
+<NetCode filename="app/api/report/route.ts">
+{`import { NextRequest, NextResponse } from "next/server";
+import { withX402, x402ResourceServer } from "@x402/next";
+import { HTTPFacilitatorClient } from "@x402/core/server";
+import { ExactEvmScheme } from "@x402/evm/exact/server";
+
+const facilitatorClient = new HTTPFacilitatorClient({ url: "{{facilitatorUrl}}" });
+const server = new x402ResourceServer(facilitatorClient)
+  .register("{{caip2}}", new ExactEvmScheme());
+
+const handler = async (_: NextRequest) => {
+  return NextResponse.json({ report: "the paid content" });
+};
+
+export const GET = withX402(
+  handler,
+  {
+    accepts: {
+      scheme: "exact",
+      network: "{{caip2}}",
+      payTo: "0xYourMerchantAddress",
+      price: {
+        asset: "{{asset}}",
+        amount: "10000",
+        extra: { name: "{{assetDomainName}}", version: "{{assetDomainVersion}}" },
+      },
+    },
+    description: "One generated report",
+  },
+  server,
+);`}
+</NetCode>
+
+To put pages behind payment, use `paymentProxy` from `@x402/next` in `proxy.ts` with the same `server` and a routes object keyed by path, exactly as in the [`@x402/next` README](https://www.npmjs.com/package/@x402/next).
+
+## Using other chains alongside Arc
+
+Keep your existing facilitator for the chains it serves and add ours for Arc. `x402ResourceServer` takes an array of facilitator clients and routes each payment to the first one that advertises its network — so a Base payment goes to the x402.org facilitator and an Arc payment comes here.
+
+<NetCode filename="server.ts">
+{`import { paymentMiddleware, x402ResourceServer } from "@x402/express";
+import { HTTPFacilitatorClient } from "@x402/core/server";
+import { ExactEvmScheme } from "@x402/evm/exact/server";
+
+const resourceServer = new x402ResourceServer([
+  new HTTPFacilitatorClient({ url: "{{facilitatorUrl}}" }),           // Arc
+  new HTTPFacilitatorClient({ url: "https://x402.org/facilitator" }), // Base Sepolia, etc.
+])
+  .register("{{caip2}}", new ExactEvmScheme())
+  .register("eip155:84532", new ExactEvmScheme());
+
+app.use(
+  paymentMiddleware(
+    {
+      "GET /api/report": {
+        accepts: [
+          {
+            scheme: "exact",
+            network: "{{caip2}}",
+            payTo: "0xYourMerchantAddress",
+            price: {
+              asset: "{{asset}}",
+              amount: "10000",
+              extra: { name: "{{assetDomainName}}", version: "{{assetDomainVersion}}" },
+            },
+          },
+          {
+            scheme: "exact",
+            network: "eip155:84532",
+            payTo: "0xYourMerchantAddress",
+            price: "$0.01", // Base is in DEFAULT_ASSETS too, so the shorthand works there
+          },
+        ],
+        description: "One generated report",
+      },
+    },
+    resourceServer,
+  ),
+);`}
+</NetCode>
+
+One 402 response then offers both; the payer picks the network it holds funds on. Nothing about your other chains changes.
+
+## Verify it works
+
+<NetCode lang="bash">
+{`curl -i http://localhost:3000/api/report`}
+</NetCode>
+
+You want a `402`, a `PAYMENT-REQUIRED` header, and — once you base64-decode it — your `asset`, `amount` and `extra` echoed back exactly. If `extra` is empty there, stop and fix it before you go further: that is the failure mode described above.
+
+Then point an agent at it: [pay for an endpoint](/docs/quickstart-agent).
+
+## Get discovered
+
+Add a name, icon, tags and input/output docs to your route and you are listed in the [Bazaar](/bazaar), where agents look for APIs to pay. Listing happens after your first settled payment, or right away if you register. See [List your API in the Bazaar](/docs/bazaar).
+
+## Things to get right before production
+
+- **`payTo` is where the money lands.** It is in the signed message, so neither we nor anyone else can redirect it — but a typo sends every payment to the typo. Check it on the explorer.
+- **Charge above the dust floor.** We refuse to sponsor payments below 0.01, because the gas would exceed the transfer. See [limits](/docs/limits).
+- **Handle a 402 that stays 402.** Settlement can fail after a valid verification — an expired authorization, a blocked payer, our gas wallet running low. Treat it as a retryable failure, not a successful sale.
+- **Read [limits](/docs/limits).** Rate limits apply per merchant address.

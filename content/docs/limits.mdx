@@ -1,0 +1,63 @@
+This is a free public service that pays gas out of its own wallet, so it has to have limits. They exist to stop one caller draining the gas wallet everyone shares — not to meter you. On Arc that wallet holds USDC, because USDC is what gas is paid in.
+
+Nothing is ever broadcast when a limit refuses a request, so a `429` or `503` costs you nothing but a retry.
+
+## Rate limits
+
+Counted per 60-second window. The first one you exceed is the one you hit.
+
+| Scope | Default | Why |
+| --- | --- | --- |
+| Per client IP | 120 / min | Blunt instrument against a loop |
+| Per payer address | 30 / min | One agent cannot crowd out the rest |
+| Per `payTo` (merchant) | 120 / min | One merchant cannot either |
+| Facilitator-wide | 1200 / min | Bounds our RPC fan-out |
+
+A refusal is `429` with a `Retry-After` header in seconds. Honour it rather than retrying immediately.
+
+## Minimum payment
+
+**0.01 USDC** — `amount: "10000"` at six decimals.
+
+Below that, the gas we spend exceeds the value being transferred. On Arc that comparison is exact rather than approximate, because the gas and the payment are the same asset: a settlement uses 70,000–90,000 gas at a 20 gwei floor, so roughly **0.0017–0.0022 USDC**. The 0.01 floor clears it about five-fold. Payments under the floor are rejected with `amount_below_minimum`.
+
+There is no maximum. The amount is in the payer's signature, so it is bounded by what they chose to sign.
+
+## Gas
+
+There is no daily gas budget. Settlement is limited only by the facilitator's USDC balance; below the operating floor (`MIN_SIGNER_BALANCE_USDC`, 0.05 USDC by default, roughly 25 settlements) `/settle` returns `503 signer_balance_low`. Check it:
+
+<NetCode lang="bash">
+{`curl -s {{facilitatorUrl}}/health | jq '.networks[] | {network, status, balanceUsdc, gasPriceGwei, estimatedSettlesLeft}'`}
+</NetCode>
+
+`balanceUsdc` is the signer's native (18-decimal) USDC balance, which is what gas is deducted from. `gasPriceGwei` should never read below Arc's 20 gwei floor.
+
+## Per-settlement gas cap
+
+Each settlement is capped at **300,000 gas**. A normal EIP-3009 transfer uses 70,000–90,000, so this only bites on something pathological — which is the point: a single request cannot cost us an unbounded amount.
+
+## Mainnet kill switch
+
+Mainnet settlement can be switched off, and ships that way. On Arc this is the only thing standing between a mainnet request and real money moving — mainnet USDC genuinely supports EIP-3009 and is allowlisted, so there is no technical obstacle, just the switch. When it is off:
+
+- `/verify` keeps working, so you can validate an integration without us spending anything
+- `/settle` returns `503` with `mainnet_disabled`
+- `/health` reports that network as `status: "disabled"`
+
+Testnet is unaffected. If you need mainnet to be reliably on, [run your own instance](/docs/self-host).
+
+## Low-balance refusal
+
+If our signer's USDC drops below the operating floor, `/settle` returns `503` with `signer_balance_low` rather than broadcasting a transaction that would fail. `/health` reports `degraded`. This is a failure we would rather hand you cleanly than pretend about.
+
+It is worth knowing why a clean refusal matters more on Arc than elsewhere: an underpriced or unfunded transaction here is not rejected with an error, it is **silently dropped by the mempool** — no receipt, no revert, nothing to look at. A `503` you can retry is strictly better than a broadcast that disappears.
+
+## What is not limited
+
+- `/supported`, `/assets`, `/health` and the log endpoints are not rate limited beyond the per-IP ceiling.
+- `/verify` is included in the counts, but it spends no gas — call it as much as the rate limit allows.
+
+## If the limits do not fit
+
+They are all environment variables on a service you can run yourself. [Self-host](/docs/self-host): same code, your signer. Your merchant config changes by exactly one URL.

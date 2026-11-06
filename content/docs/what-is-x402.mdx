@@ -1,0 +1,73 @@
+HTTP has had a status code reserved for this since 1997: `402 Payment Required`. It was never specified — just set aside. x402 fills in the blank. The idea is that a server can answer "you need to pay for this" in a way a machine understands well enough to pay without a human present.
+
+That last part is the point. A checkout page assumes a person who can read, click and wait. An AI agent calling forty APIs cannot do any of that.
+
+## The handshake
+
+```http
+GET /api/report
+→ 402 Payment Required
+  PAYMENT-REQUIRED: <base64 JSON: what it costs, in what token, on what chain, to whom>
+
+GET /api/report
+  PAYMENT-SIGNATURE: <base64 JSON: a signed authorization for exactly that>
+→ 200 OK
+  PAYMENT-RESPONSE: <base64 JSON: the transaction hash>
+```
+
+Two requests. The second one carries payment. No redirect, no session, no webhook, no callback URL.
+
+## The four parties
+
+| Party | Role |
+| --- | --- |
+| **Payer** | A person's wallet or an agent's key. Signs payment authorizations. Holds the stablecoin. |
+| **Resource server** | Your API. Declares the price, checks payment, serves the content. Holds nothing. |
+| **Facilitator** | This service. Verifies signatures, submits them on-chain, pays the gas. Holds nothing. |
+| **Chain** | Arc. Executes the transfer and is the record of it. |
+
+The facilitator is optional in the protocol — your server could talk to the chain itself. You would then need an RPC connection, a funded hot wallet, nonce management, and the discipline to simulate before broadcasting. Delegating that is the whole reason facilitators exist.
+
+## What "gasless" actually means
+
+It is worth being precise, because the word oversells itself.
+
+Gas is still paid. **Someone else pays it.** On an EVM chain the mechanism is EIP-3009: the token contract exposes
+
+```solidity
+function transferWithAuthorization(
+  address from, address to, uint256 value,
+  uint256 validAfter, uint256 validBefore, bytes32 nonce,
+  uint8 v, bytes32 r, bytes32 s
+) external;
+```
+
+Anyone may call it. The contract recovers the signature, confirms it was signed by `from` under its own EIP-712 domain, and moves the tokens. So the payer signs; a third party submits and pays the fee.
+
+> There is no transaction batching involved. If you have seen gasless payments described as "grouping the payer's transaction with the facilitator's", that is Algorand's atomic transaction groups — a different chain with a different model. On an EVM chain there is one transaction, sent by us, authorised by them.
+
+## What "gasless" means on Arc specifically
+
+On most chains the pitch lands as "the payer needs zero ETH" — a token they would otherwise have to go and get before spending the token they already hold. Arc removes that errand at the protocol level: **USDC is the gas token.** So the x402 claim has to be stated differently, and it ends up stronger.
+
+The payer does not need a gas balance, because they never send a transaction. They sign. We send. The money that leaves their account is exactly the amount in their signature — not that amount plus a fee.
+
+That is worth dwelling on, because it is the one thing you cannot demonstrate with a balance check. On a chain where gas is a separate token you can point at a wallet holding zero of it and say "look, no gas". On Arc a paying account necessarily holds the gas token, since it is the same asset. The honest proof is arithmetic instead:
+
+> the payer's balance falls by exactly the authorized amount, and not one unit more.
+
+Arc exposes USDC through two interfaces over one balance — native at 18 decimals, ERC-20 at 6 — and the native view is where gas would be deducted. A single wei charged to the payer would show up there, four orders of magnitude below what the 6-decimal view can even represent. [`pnpm smoke`](/docs/self-host) asserts exactly that equality, and the [test page](/test) shows both views of your own balance before and after.
+
+## What the signature can and cannot do
+
+A `TransferWithAuthorization` signature commits to the recipient, the exact amount, a validity window and a single-use nonce. So:
+
+- We cannot change the amount, redirect the funds, or reuse it. The contract enforces all three.
+- We cannot pay ourselves. The recipient is in the signed message.
+- We can decline to submit it. That is the full extent of our power — and the reason "non-custodial" is accurate rather than marketing.
+
+If we vanished mid-payment, the worst outcome is a signature that expires unused. Nothing is held anywhere to be lost.
+
+## Next
+
+[Choose a network](/docs/choose-a-network), then [charge for an endpoint](/docs/quickstart-merchant).

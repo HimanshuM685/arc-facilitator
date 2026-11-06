@@ -1,0 +1,258 @@
+The [Bazaar](/bazaar) is this facilitator's directory of x402 APIs. Each merchant is a **pay-to address**, with a name, a website, its icon, and every x402 endpoint it sells, each with docs an agent can read.
+
+It is the standard x402 Bazaar discovery extension: agents read it with the official client, and you describe your endpoints with the official `@x402/extensions` package. Nothing here is specific to us except the URL.
+
+## How an endpoint gets listed
+
+1. **It gets into the catalog** when a payment for it settles through this facilitator, or when your code registers it (below).
+2. **We verify it.** We call the endpoint ourselves. Its live `402` must name the same pay-to address, on a network we serve. If it does, it is listed under that address. If it pays someone else, or does not answer with a valid `402`, it is not shown.
+3. **We keep checking.** Every endpoint is re-verified every 10 payments or once a day, whichever comes first. If it stops matching, it drops out of the Bazaar until it matches again.
+
+Nothing in a payment or a registration is trusted on its own. The live `402` from your server is the proof.
+
+## 1. Describe your endpoint
+
+Add a name, icon and tags to the route, and the `bazaar` extension with what the endpoint takes and returns. Agents see exactly this.
+
+<NetCode lang="bash">
+{`npm install @x402/core @x402/evm @x402/express @x402/extensions`}
+</NetCode>
+
+<NetCode filename="server.ts">
+{`import express from "express";
+import { paymentMiddleware, x402ResourceServer } from "@x402/express";
+import { HTTPFacilitatorClient } from "@x402/core/server";
+import { ExactEvmScheme } from "@x402/evm/exact/server";
+import { bazaarResourceServerExtension, declareDiscoveryExtension } from "@x402/extensions/bazaar";
+
+const app = express();
+app.use(express.json());
+
+const resourceServer = new x402ResourceServer(new HTTPFacilitatorClient({ url: "{{facilitatorUrl}}" }))
+  .register("{{caip2}}", new ExactEvmScheme())
+  .registerExtension(bazaarResourceServerExtension);
+
+app.use(
+  paymentMiddleware(
+    {
+      "POST /x402/top-up": {
+        accepts: {
+          scheme: "exact",
+          network: "{{caip2}}",
+          payTo: "0xYourMerchantAddress",
+          price: {
+            asset: "{{asset}}",
+            amount: "10000",
+            extra: { name: "{{assetDomainName}}", version: "{{assetDomainVersion}}" },
+          },
+        },
+        description: "Top up a prepaid account by 0.01 USDC",
+        mimeType: "application/json",
+        serviceName: "Acme",
+        iconUrl: "https://acme.example/icon.png",
+        tags: ["payments", "prepaid"],
+        extensions: declareDiscoveryExtension({
+          bodyType: "json",
+          input: { accountId: "acct_123" },
+          inputSchema: {
+            properties: { accountId: { type: "string" } },
+            required: ["accountId"],
+          },
+          output: { example: { ok: true, balance: "1.25" } },
+        }),
+      },
+    },
+    resourceServer,
+  ),
+);`}
+</NetCode>
+
+| Field | Shown as |
+| --- | --- |
+| `serviceName` | The merchant's name on its Bazaar page |
+| `iconUrl` | Its icon. Without one we use your site's `/favicon.ico` |
+| `description`, `tags`, `mimeType` | On the endpoint's card |
+| `declareDiscoveryExtension(...)` | The endpoint's docs: input example and schema, output example and schema |
+
+The HTTP method comes from the route key (`"POST /x402/top-up"`), which is why `bazaarResourceServerExtension` is registered.
+
+That alone is enough: the first payment that settles through us lists the endpoint.
+
+## 2. Register up front (optional)
+
+To be listed before your first sale, or to list several endpoints at once, have your code call:
+
+<NetCode lang="bash">
+{`curl -X POST {{facilitatorUrl}}/discovery/register \\
+  -H 'content-type: application/json' \\
+  -d '{
+    "payTo": "0xYourMerchantAddress",
+    "name": "Acme",
+    "website": "https://acme.example",
+    "endpoints": [
+      "https://acme.example/x402/report",
+      { "url": "https://acme.example/x402/top-up", "method": "POST" }
+    ]
+  }'`}
+</NetCode>
+
+We call each endpoint immediately and tell you which ones made it:
+
+```json
+{
+  "merchant": { "payTo": "0x…", "name": "Acme", "website": "https://acme.example" },
+  "endpoints": [
+    { "url": "https://acme.example/x402/report", "method": "GET", "status": "verified", "detail": "live 402 pays the claimed address" },
+    { "url": "https://acme.example/x402/top-up", "method": "POST", "status": "mismatch", "detail": "402 pays a different address than the one claimed" }
+  ],
+  "listed": 1,
+  "page": "/bazaar/0x…"
+}
+```
+
+Call it again any time, say on deploy, to re-check everything. Rules:
+
+- Endpoints must be public `https://` URLs. Up to 25 per call.
+- `status` is `verified` (listed), `mismatch` (its 402 pays another address or another chain) or `unreachable` (no answer, not a `402`, or no valid `PAYMENT-REQUIRED` header).
+- `name` and `website` are optional. Without them we use your `serviceName` and the endpoint's origin.
+
+## 3. Discover a merchant's endpoints
+
+Everything in the Bazaar is readable three ways: the official x402 client, plain HTTP, and the [Bazaar pages](/bazaar). Only endpoints that passed verification are returned. Re-checks run when an endpoint is paid (every 10th payment) and, for quiet endpoints, at most a day after the last check, triggered as the catalog is read. So a listing can lag a merchant's change by up to about a day. `lastUpdated` tells you when it was last verified, and the payment itself is checked live either way: the terms you sign come from the merchant's own `402`.
+
+### With the official client
+
+`withBazaar` adds `listResources` and `search` to the standard facilitator client. A merchant is a pay-to address, so **filtering by `payTo` gives you that merchant's whole catalogue**:
+
+<NetCode filename="discover.ts">
+{`import { HTTPFacilitatorClient } from "@x402/core/http";
+import { withBazaar } from "@x402/extensions/bazaar";
+
+const facilitator = withBazaar(new HTTPFacilitatorClient({ url: "{{facilitatorUrl}}" }));
+
+// \`extensions\` is typed loosely; this is the part of the bazaar extension we read.
+type Bazaar = { info?: { input?: { method?: string; body?: unknown; queryParams?: unknown } } };
+
+// Every endpoint one merchant sells
+const { items } = await facilitator.extensions.bazaar.listResources({
+  payTo: "0xMerchantAddress",
+  network: "{{caip2}}",
+});
+
+for (const item of items) {
+  const input = (item.extensions?.bazaar as Bazaar | undefined)?.info?.input;
+  console.log(input?.method ?? "GET", item.resource, item.accepts[0]?.amount, item.description);
+}
+
+// Everything on the network, page by page
+const page = await facilitator.extensions.bazaar.listResources({ network: "{{caip2}}", limit: 20, offset: 0 });
+console.log(page.pagination.total, "verified endpoints");
+
+// Or by keyword: name, description, URL and tags are searched
+const { resources } = await facilitator.extensions.bazaar.search({ query: "top-up" });`}
+</NetCode>
+
+### Over plain HTTP
+
+Same data, no SDK. Both are `GET` and need no auth.
+
+<NetCode lang="bash">
+{`# One merchant's endpoints
+curl -s '{{facilitatorUrl}}/discovery/resources?payTo=0xMerchantAddress' | jq '.items[] | {resource, price: .accepts[0].amount}'
+
+# All endpoints on this network, paginated
+curl -s '{{facilitatorUrl}}/discovery/resources?network={{caip2}}&limit=20&offset=0' | jq '.pagination'
+
+# Keyword search
+curl -s '{{facilitatorUrl}}/discovery/search?query=top-up' | jq '.resources[].resource'`}
+</NetCode>
+
+Want the merchant itself (name, website, icon) rather than a flat endpoint list? That is what the Bazaar pages read:
+
+<NetCode lang="bash">
+{`# Merchant cards: one per pay-to address with at least one verified endpoint
+curl -s '{{facilitatorUrl}}/api/bazaar?network={{network}}' | jq '.merchants[] | {payTo, name, website, endpointCount}'
+
+# One merchant and all its verified endpoints
+curl -s '{{facilitatorUrl}}/api/bazaar/0xMerchantAddress' | jq '{merchant, endpoints: [.endpoints[] | {method, resource}]}'`}
+</NetCode>
+
+For people, the same merchant lives at <code>/bazaar/0xMerchantAddress</code>.
+
+### What each endpoint tells you
+
+| Field | Meaning |
+| --- | --- |
+| `resource` | The URL to call |
+| `accepts[]` | The live payment terms we verified: `payTo`, `asset`, `amount` (base units, 6 decimals), `network` |
+| `serviceName`, `iconUrl`, `tags`, `description`, `mimeType` | What the merchant declared on the route |
+| `extensions.bazaar.info.input` | How to call it: `method`, and a `body` (with `bodyType`) or `queryParams` example |
+| `extensions.bazaar.info.output.example` | What a successful response looks like |
+| `extensions.bazaar.schema` | JSON Schema for the input and output, for validation or tool definitions |
+| `lastUpdated` | When we last verified its live `402` |
+
+### Find, then pay
+
+Discovery gives you everything needed to make the call; `@x402/fetch` pays for it:
+
+<NetCode filename="find-and-pay.ts">
+{`import { HTTPFacilitatorClient } from "@x402/core/http";
+import { withBazaar } from "@x402/extensions/bazaar";
+import { wrapFetchWithPaymentFromConfig } from "@x402/fetch";
+import { ExactEvmScheme } from "@x402/evm/exact/client";
+import { privateKeyToAccount } from "viem/accounts";
+
+type Input = {
+  method?: string;
+  queryParams?: Record<string, unknown>;
+  bodyType?: "json" | "form-data" | "text";
+  body?: unknown;
+};
+type Bazaar = { info?: { input?: Input } };
+
+const facilitator = withBazaar(new HTTPFacilitatorClient({ url: "{{facilitatorUrl}}" }));
+
+// Always pin the network: the same merchant can sell on testnet and mainnet.
+const { items } = await facilitator.extensions.bazaar.listResources({
+  payTo: "0xMerchantAddress",
+  network: "{{caip2}}",
+});
+
+const endpoint = items.find((i) => i.resource.endsWith("/x402/top-up"));
+if (!endpoint) throw new Error("not listed");
+
+const terms = endpoint.accepts.find((a) => a.network === "{{caip2}}")!;
+const input = (endpoint.extensions?.bazaar as Bazaar | undefined)?.info?.input ?? {};
+
+// Build the request the way the endpoint says it takes input.
+const url = new URL(endpoint.resource);
+for (const [k, v] of Object.entries(input.queryParams ?? {})) url.searchParams.set(k, String(v));
+
+const init: RequestInit = { method: input.method ?? "GET" };
+if (input.body !== undefined) {
+  if (input.bodyType === "form-data") {
+    const form = new FormData();
+    for (const [k, v] of Object.entries(input.body as Record<string, unknown>)) form.append(k, String(v));
+    init.body = form;
+  } else if (input.bodyType === "text") {
+    init.headers = { "content-type": "text/plain" };
+    init.body = String(input.body);
+  } else {
+    init.headers = { "content-type": "application/json" };
+    init.body = JSON.stringify(input.body);
+  }
+}
+
+const account = privateKeyToAccount(process.env.AGENT_PRIVATE_KEY as \`0x\${string}\`);
+const fetchWithPayment = wrapFetchWithPaymentFromConfig(fetch, {
+  schemes: [{ network: terms.network, client: new ExactEvmScheme(account) }],
+  spendControls: {
+    allowedAssets: [{ network: terms.network, asset: terms.asset, maxAmountPerPayment: terms.amount }],
+  },
+});
+
+const response = await fetchWithPayment(url, init);
+console.log(await response.json());`}
+</NetCode>
+
+The example input from the listing is used as-is here; in a real agent, replace it with your own values in the same shape. Pinning `network` keeps a testnet agent from ever paying a mainnet listing, and capping `maxAmountPerPayment` at the listed `amount` means the agent refuses to pay more than what the Bazaar showed, even if the merchant's price changes between discovery and the call. Every merchant page in the [Bazaar](/bazaar) has this snippet pre-filled per endpoint. More on paying in [pay for an endpoint](/docs/quickstart-agent).

@@ -1,0 +1,62 @@
+Arc mainnet is chain `5042`. USDC on it implements EIP-3009 and is allowlisted here, so mainnet settlement works — the same contract at the same address as on testnet, with the same EIP-712 domain. Nothing about your integration changes except the network identifier.
+
+## Before you point anything at it
+
+Mainnet moves real USDC, so check that this instance will actually settle. Mainnet settlement is behind a switch (`MAINNET_ENABLED`) that ships **off**:
+
+<NetCode lang="bash">
+{`curl -s {{facilitatorUrl}}/health | jq '.networks[] | select(.network=="mainnet")'`}
+</NetCode>
+
+- `status: "disabled"` — `/verify` works, `/settle` returns `503 mainnet_disabled`. You can validate an integration end to end without anyone spending anything.
+- `status: "ok"` — settlement is live, and the `balanceUsdc` and `estimatedSettlesLeft` fields tell you how much runway the signer has.
+- `status: "degraded"` — the RPC is unreachable or the signer is below its operating floor. See [limits](/docs/limits).
+
+If you need mainnet reliably on, with your own signer and your own limits, [run your own instance](/docs/self-host). It is the same code and one environment variable.
+
+## Network details
+
+<div className="not-prose">
+  <div className="glass px-4 py-2">
+    <NetField label="Chain ID" k="chainId" />
+    <NetField label="CAIP-2" k="caip2" />
+    <NetField label="RPC" k="rpc" />
+    <NetField label="Explorer" k="explorer" />
+    <NetField label="Bridge" k="bridge" />
+    <NetField label="USDC" k="usdc" />
+  </div>
+</div>
+
+## Switching your config
+
+One string:
+
+<NetCode lang="ts">
+{`accepts: {
+  scheme: "exact",
+  network: "{{caip2}}",      // was eip155:5042002
+  payTo: "0xYourMerchantAddress",
+  price: "$0.01",
+}`}
+</NetCode>
+
+The asset address is the same on both networks, so there is nothing else to change. The facilitator URL stays the same too — x402 carries the network inside the payment payload.
+
+> Use a different `payTo` for mainnet than for testnet. The settlement log is public, and tying test traffic to your production revenue address makes both easier to analyse than you probably want.
+
+## Getting USDC onto Arc
+
+- [Circle's USDC Bridge](https://bridge.usdc.com) moves USDC directly between supported chains.
+- CCTP burns and mints natively rather than wrapping; Arc's CCTP domain is `26`. Addresses are in the [network reference](/docs/network-reference).
+- Gateway gives you a chain-abstracted USDC balance you can draw on from Arc.
+
+Remember that USDC on Arc is the gas token, so funding a wallet for gas and funding it to spend are the same action.
+
+## Running your own signer on mainnet
+
+If you self-host, two things are worth getting right before you enable mainnet:
+
+1. **Fund the signer and watch it.** Gas comes out of its USDC balance. `MIN_SIGNER_BALANCE_USDC` makes `/settle` refuse cleanly rather than broadcast into failure — which matters on Arc, where an underfunded or underpriced transaction is silently dropped by the mempool instead of reverting.
+2. **Run `pnpm verify-assets` against mainnet.** It reads the token's real `DOMAIN_SEPARATOR()` and proves the registry's EIP-712 domain against it. A wrong domain fails every signature with nothing on-chain to debug, and that is a far more annoying thing to discover in production than in a script.
+
+Then [self-host](/docs/self-host) has the rest of the runbook.

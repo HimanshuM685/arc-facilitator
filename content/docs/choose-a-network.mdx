@@ -1,0 +1,87 @@
+Arc has a mainnet and a testnet. Both are EVM-compatible Layer-1s built by Circle, both use USDC for gas, and both produce a block roughly every half second with deterministic finality on inclusion. This facilitator serves both from one URL.
+
+## Which one do I want
+
+**Arc Testnet (chain 5042002)** — anything that is not production. Tokens have no value, the [faucet](https://faucet.circle.com) is free. Build here.
+
+**Arc mainnet (chain 5042)** — real money. USDC on mainnet implements EIP-3009 and is allowlisted, so mainnet settlement genuinely works; what stops it is a deliberate switch. This instance ships with `MAINNET_ENABLED=false`, which means `/verify` answers normally and `/settle` returns `503 mainnet_disabled`. That lets you validate a mainnet integration end to end without anyone spending anything, then flip the switch — or [run your own instance](/docs/self-host) — when you are ready.
+
+Unlike chains where a testnet token supports EIP-3009 and the mainnet one does not, the two Arc networks are symmetric: same contract, same address, same domain version. An integration that works on testnet works on mainnet by changing one string.
+
+## The toggle
+
+Every page on this site reads a single network selection, set by the control in the header. It changes:
+
+- every address, chain id, RPC and explorer link shown
+- every code sample — you copy snippets already pointed at the network you selected
+- the [transaction log](/logs) and the counters on the front page
+
+The selection is stored in your browser and mirrored into the URL as `?network=…`, so a link you paste into a chat opens on the same network you were reading.
+
+Right now you are reading the <NetVal k="networkName" mono={false} /> docs.
+
+## What differs in practice
+
+<div className="not-prose">
+  <div className="glass px-4 py-2">
+    <NetField label="Network" k="networkName" />
+    <NetField label="Chain ID" k="chainId" />
+    <NetField label="CAIP-2 (what x402 calls it)" k="caip2" />
+    <NetField label="RPC" k="rpc" />
+    <NetField label="Explorer" k="explorer" />
+    <NetField label="Bridge" k="bridge" />
+    <NetField label="Faucet" k="faucet" />
+    <NetField label="USDC" k="usdc" />
+  </div>
+</div>
+
+<OnlyOn network="testnet">
+On Arc Testnet you pay with **USDC**, which supports EIP-3009 natively. Get some from the
+[Circle faucet](https://faucet.circle.com) — the same USDC pays for gas, if you ever send an
+ordinary transaction, and you need none of it to make an x402 payment.
+</OnlyOn>
+
+<OnlyOn network="mainnet">
+Mainnet USDC is the same contract at the same address as on testnet, and is allowlisted here.
+Whether this instance will actually settle a mainnet payment depends on `MAINNET_ENABLED`; check
+[/health](/health) — a network reporting `status: "disabled"` will verify but not settle. Move USDC
+onto Arc with [Circle's USDC Bridge](https://bridge.usdc.com) or CCTP.
+</OnlyOn>
+
+## Switching an existing integration
+
+Change one string: the CAIP-2 network identifier in your `accepts` config.
+
+<NetCode lang="ts">
+{`accepts: {
+  scheme: "exact",
+  network: "{{caip2}}",
+  payTo: "0xYourMerchantAddress",
+  price: "$0.01",
+}`}
+</NetCode>
+
+Both Arc networks are in the x402 SDK's default asset table, so `price: "$0.01"` resolves to USDC on its own. The explicit form still works if you prefer it:
+
+<NetCode lang="ts">
+{`accepts: {
+  scheme: "exact",
+  network: "{{caip2}}",
+  payTo: "0xYourMerchantAddress",
+  price: {
+    asset: "{{asset}}",
+    amount: "10000",
+    extra: { name: "{{assetDomainName}}", version: "{{assetDomainVersion}}" },
+  },
+}`}
+</NetCode>
+
+The asset address is identical on both networks, because Arc's USDC is a predeploy rather than a per-network deployment. The facilitator URL stays the same. Nothing else moves.
+
+> The shared address is worth knowing about, because it means the address cannot tell the networks apart. A signature still cannot cross between them — `chainId` is part of the EIP-712 domain it was signed under, and this facilitator checks the CAIP-2 identifier before it looks at the asset at all.
+
+> Do not reuse one address as both your testnet and mainnet merchant wallet if you can avoid it. The log is public, and tying your test traffic to your production revenue address makes both easier to analyse than you probably want.
+
+## Separate logs
+
+Each network writes to its own table, so the two views never mix. A mainnet figure on the front page is mainnet-only, and filtering the log by your address on testnet will not surface mainnet rows.

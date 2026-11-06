@@ -1,0 +1,12 @@
+node_modules/
+.next/
+next-env.d.ts
+*.tsbuildinfo
+
+.env
+.env.local
+
+# Generated tool output
+graphify-out/
+
+.DS_Store
