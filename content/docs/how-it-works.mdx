@@ -3,32 +3,46 @@ The mechanism in full, including what we can do with your signature and what we 
 ## The sequence
 
 ```
-payer                merchant                facilitator               Arc    
-  │                     │                         │                     │
-  │── GET /report ─────▶│                         │                     │
-  │◀── 402 + terms ─────│                         │                     │
-  │                     │                         │                     │
-  │ sign TransferWith-  │                         │                     │
-  │ Authorization       │                         │                     │
-  │ (offline, no gas)   │                         │                     │
-  │                     │                         │                     │
-  │── GET /report ─────▶│                         │                     │
-  │   PAYMENT-SIGNATURE │── POST /verify ────────▶│                     │
-  │                     │                         │── eth_call ────────▶│
-  │                     │◀── isValid: true ───────│                     │
-  │                     │                         │                     │
-  │                     │  (your handler runs)    │                     │
-  │                     │                         │                     │
-  │                     │── POST /settle ────────▶│                     │
-  │                     │                         │── transferWith-     │
-  │                     │                         │   Authorization ───▶│
-  │                     │                         │  (we pay the USDC)  │
-  │                     │◀── tx hash ─────────────│◀── receipt ─────────│
-  │◀── 200 + content ───│                         │                     │
-  │   PAYMENT-RESPONSE  │                         │                     │
+payer                merchant                facilitator             Arc
+  │                     │                       │                     │
+  │── GET /report ─────▶│                       │                     │
+  │◀── 402 + terms ─────│                       │                     │
+  │                     │                       │                     │
+  │ sign TransferWith-  │                       │                     │
+  │ Authorization       │                       │                     │
+  │ (offline, no gas)   │                       │                     │
+  │                     │                       │                     │
+  │── GET /report ─────▶│                       │                     │
+  │   PAYMENT-SIGNATURE │── POST /verify ──────▶│                     │
+  │                     │                       │── eth_call ────────▶│
+  │                     │◀── isValid: true ─────│                     │
+  │                     │                       │                     │
+  │                     │  (your handler runs)  │                     │
+  │                     │                       │                     │
+  │                     │── POST /settle ──────▶│                     │
+  │                     │                       │── simulate again ──▶│
+  │                     │                       │── transferWith-     │
+  │                     │                       │   Authorization ───▶│
+  │                     │                       │ (the fee: our USDC) │
+  │                     │◀── tx hash ───────────│◀── receipt ─────────│
+  │◀── 200 + content ───│                       │                     │
+  │   PAYMENT-RESPONSE  │                       │                     │
 ```
 
-Note the ordering: your handler runs between verify and settle. A request that fails inside your code does not charge the customer.
+Two things in that picture earn their place.
+
+**Your handler runs between verify and settle.** A request that fails inside your code does not charge the customer.
+
+**`/settle` simulates again before it broadcasts.** Nothing concluded a moment earlier is assumed to still hold — which on Arc is not paranoia: a transfer that reverts on USDC's runtime blocklist still consumes gas. See [below](#two-arc-specific-failure-modes).
+
+And because gas on Arc is USDC, that one transaction moves the same asset twice, out of two different accounts:
+
+```
+payer        ── the amount in the signature ──▶  merchant
+facilitator  ── the gas fee ──────────────────▶  block beneficiary
+```
+
+Neither movement can reach the other. `to` and `value` live inside the signed message, and the account charged for gas is whoever sent the transaction — us.
 
 ## What the payer signs
 

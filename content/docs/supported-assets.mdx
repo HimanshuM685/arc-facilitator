@@ -31,7 +31,7 @@ Two consequences worth internalising:
 - **Never compare the two raw.** They differ by a trillion. Mixing `msg.value` with `balanceOf()` in the same expression is the canonical Arc bug.
 - **A zero `balanceOf` does not mean a zero balance.** The ERC-20 view truncates fractional amounts below one unit at 6 decimals; the USDC is still there natively. Credit and record balances from the 18-decimal view, or you will record less than was transferred.
 
-For payments, stay on the ERC-20 interface: amounts, prices and `decimals()` all live there. The native view matters only when you are reasoning about gas — which is what [/health](/health) reports and what `pnpm smoke` asserts against.
+For payments, stay on the ERC-20 interface: amounts, prices and `decimals()` all live there. The native view matters only when you are reasoning about gas — which is what [/health](/health) reports and what [`pnpm smoke`](/docs/self-host#checking-it-works) asserts against.
 
 ## The `extra` values — use these exactly
 

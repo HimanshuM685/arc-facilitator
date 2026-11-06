@@ -82,7 +82,7 @@ Then prove it to yourself on the explorer. Open the settlement hash and check th
 2. The transaction's `from` is **our facilitator signer**, and the fee came out of our balance.
 3. The payer's balance fell by the payment amount and nothing else.
 
-That last one is the Arc-specific version of the claim, and the only one that actually proves gas was sponsored here. The [test page](/test) computes it for you from both views of your balance, and `pnpm smoke` asserts it.
+That last one is the Arc-specific version of the claim, and the only one that actually proves gas was sponsored here. The [test page](/test) computes it for you from both views of your balance, and [`pnpm smoke`](/docs/self-host#checking-it-works) asserts it.
 
 > Arc also emits a standard `Transfer` log for native USDC movements (EIP-7708), from a system emitter as well as from the token contract. If you are indexing logs rather than reading receipts, be careful not to count a single payment twice.
 

@@ -56,7 +56,7 @@ That is worth dwelling on, because it is the one thing you cannot demonstrate wi
 
 > the payer's balance falls by exactly the authorized amount, and not one unit more.
 
-Arc exposes USDC through two interfaces over one balance — native at 18 decimals, ERC-20 at 6 — and the native view is where gas would be deducted. A single wei charged to the payer would show up there, four orders of magnitude below what the 6-decimal view can even represent. [`pnpm smoke`](/docs/self-host) asserts exactly that equality, and the [test page](/test) shows both views of your own balance before and after.
+Arc exposes USDC through two interfaces over one balance — native at 18 decimals, ERC-20 at 6 — and the native view is where gas would be deducted. A single wei charged to the payer would show up there, four orders of magnitude below what the 6-decimal view can even represent. [`pnpm smoke`](/docs/self-host#checking-it-works) asserts exactly that equality, and the [test page](/test) shows both views of your own balance before and after.
 
 ## What the signature can and cannot do
 

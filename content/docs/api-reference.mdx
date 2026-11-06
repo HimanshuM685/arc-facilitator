@@ -89,14 +89,21 @@ Scheme and network discovery.
 ```json
 {
   "kinds": [
-    { "x402Version": 2, "scheme": "exact", "network": "eip155:5042002" }
+    { "x402Version": 2, "scheme": "exact", "network": "eip155:5042002" },
+    { "x402Version": 2, "scheme": "exact", "network": "eip155:5042" }
   ],
-  "extensions": [],
-  "signers": { "eip155:*": ["0x…"], "eip155:5042002": ["0x…"] }
+  "extensions": ["bazaar"],
+  "signers": {
+    "eip155:*": ["0x…"],
+    "eip155:5042002": ["0x…"],
+    "eip155:5042": ["0x…"]
+  }
 }
 ```
 
-`signers` is the address that pays your gas. Only networks with at least one servable asset are listed, so mainnet is absent until it has one.
+`signers` is the address that pays your gas — one key here, so the same address on both networks. `extensions` advertises the Bazaar discovery extension; `withBazaar(client)` reads it to decide whether `/discovery/*` is available.
+
+Both networks are listed because both have an allowlisted asset. **That is a statement about assets, not about settlement:** mainnet appears here even when `MAINNET_ENABLED` is off, so a merchant's resource server initialises against it and `/verify` answers normally, while `/settle` returns `503 mainnet_disabled`. [/health](#get-health) is where you find out which.
 
 ## GET /assets
 
@@ -113,6 +120,8 @@ Not part of the x402 spec. Both Arc networks *are* in `@x402/evm`'s `DEFAULT_ASS
       "network": "testnet",
       "caip2": "eip155:5042002",
       "chainId": 5042002,
+      "name": "Arc Testnet",
+      "explorer": "https://explorer.testnet.arc.io",
       "assets": [
         {
           "symbol": "USDC",
@@ -120,7 +129,24 @@ Not part of the x402 spec. Both Arc networks *are* in `@x402/evm`'s `DEFAULT_ASS
           "address": "0x3600000000000000000000000000000000000000",
           "decimals": 6,
           "extra": { "name": "USDC", "version": "2" },
-          "domainSeparator": "0x361191522483d3…"
+          "domainSeparator": "0x361191522483d32a83e70ae7183b4b9629442c13a78bc9921d6f707911c8c6b0"
+        }
+      ]
+    },
+    {
+      "network": "mainnet",
+      "caip2": "eip155:5042",
+      "chainId": 5042,
+      "name": "Arc",
+      "explorer": "https://explorer.arc.io",
+      "assets": [
+        {
+          "symbol": "USDC",
+          "label": "USD Coin",
+          "address": "0x3600000000000000000000000000000000000000",
+          "decimals": 6,
+          "extra": { "name": "USDC", "version": "2" },
+          "domainSeparator": "0x940506929bba468048a19b567f4f0d534714bc06604b5c3017e5d16785ccdf84"
         }
       ]
     }
@@ -128,7 +154,7 @@ Not part of the x402 spec. Both Arc networks *are* in `@x402/evm`'s `DEFAULT_ASS
 }
 ```
 
-Drop `extra` straight into your route's `price`.
+Drop `extra` straight into your route's `price`. Note what is identical across the two networks and what is not: same address, same `extra`, **different `domainSeparator`** — because `chainId` is part of the EIP-712 domain. That is what binds a signature to one network when the token address cannot.
 
 ## GET /health
 
@@ -148,16 +174,30 @@ Per-network operational state. Returns `200` when healthy, `503` when degraded, 
       "network": "testnet",
       "caip2": "eip155:5042002",
       "status": "ok",
-      "blockNumber": "…",
-      "balanceUsdc": "…",
+      "blockNumber": "71105558",
+      "balanceUsdc": "0.84",
       "gasPriceGwei": "25.00",
-      "estimatedSettlesLeft": 2300
+      "estimatedSettlesLeft": 395
+    },
+    {
+      "network": "mainnet",
+      "caip2": "eip155:5042",
+      "status": "disabled",
+      "detail": "MAINNET_ENABLED is not true; /verify still works."
     }
   ]
 }
 ```
 
-A network's `status` can also be `disabled` — mainnet settlement switched off — in which case `/verify` still works and `/settle` returns 503.
+| Field | Meaning |
+| --- | --- |
+| `status` | `ok`, `degraded` (RPC unreachable, or the signer is under its floor) or `disabled` (mainnet settlement switched off — `/verify` still works, `/settle` returns `503`) |
+| `detail` | Present on `degraded` and `disabled`: why, in one sentence |
+| `balanceUsdc` | The signer's **native** (18-decimal) USDC balance, which is what gas is deducted from |
+| `gasPriceGwei` | Current gas price. Should never read below Arc's 20 gwei floor |
+| `estimatedSettlesLeft` | `balanceUsdc` divided by a typical settle (85,000 gas) at the current price — an estimate, not a guarantee |
+
+A `degraded` network makes the whole body `degraded` and the response `503`, so this drops straight into an uptime check. A `disabled` one does not: mainnet being off is a configuration, not an outage.
 
 ## GET /api/logs
 

@@ -24,7 +24,7 @@ export const DOCS: DocSection[] = [
       {
         slug: "choose-a-network",
         title: "Choose a network",
-        summary: "Mainnet or Sepolia — what differs and how the toggle works.",
+        summary: "Arc mainnet or Arc Testnet — what differs and how the toggle works.",
       },
     ],
   },
@@ -54,7 +54,7 @@ export const DOCS: DocSection[] = [
       {
         slug: "quickstart-mainnet",
         title: "Mainnet setup",
-        summary: "Why mainnet has no servable asset yet.",
+        summary: "Real money behind a switch: what to check before you point at it.",
       },
     ],
   },
@@ -74,12 +74,12 @@ export const DOCS: DocSection[] = [
       {
         slug: "supported-assets",
         title: "Supported assets",
-        summary: "Which tokens work on which network, and why some do not.",
+        summary: "USDC on both networks, its EIP-712 domain, and the two decimal views.",
       },
       {
         slug: "network-reference",
         title: "Network reference",
-        summary: "Chain ids, RPCs, explorers, deployed contracts.",
+        summary: "Chain ids, RPCs, explorers, contracts, and Arc's EVM differences.",
       },
       {
         slug: "limits",

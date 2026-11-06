@@ -39,6 +39,37 @@ Run `verify-assets` before anything else. It checks every allowlisted token's EI
 | `RATE_LIMIT_PAYER_PER_MIN` | `30` | |
 | `RATE_LIMIT_PAYTO_PER_MIN` | `120` | |
 | `RATE_LIMIT_GLOBAL_PER_MIN` | `1200` | |
+| `BAZAAR_ALLOW_PRIVATE_TARGETS` | `false` | Development only. Lets `/discovery/register` fetch private, loopback and link-local URLs that the SSRF guard otherwise refuses. Never set it anywhere that accepts registrations from the internet. |
+
+## Checking it works
+
+Three scripts, cheapest first. Each one fails loudly rather than warning.
+
+```bash
+pnpm test            # the guards, in isolation: allowlist, dust floor, rate limits
+pnpm verify-assets   # every allowlisted asset, against the live chain
+pnpm smoke           # one real payment, end to end, against a running instance
+```
+
+`pnpm verify-assets` is the one to run on every deploy. It reads each token's own `DOMAIN_SEPARATOR()` and proves the registry's EIP-712 domain reproduces it, plus decimals and the canonical EIP-3009 typehash. A wrong domain fails every signature with nothing on-chain to debug, so this is the check that saves an afternoon.
+
+`pnpm smoke` is the end-to-end proof, and it needs two more variables:
+
+| Variable | Notes |
+| --- | --- |
+| `SMOKE_PAYER_PRIVATE_KEY` | An account holding USDC. Must not be the `SMOKE_PAY_TO` account. |
+| `SMOKE_PAY_TO` | Where the test payment lands — an address you control. |
+
+```bash
+pnpm smoke
+pnpm smoke -- --network=mainnet --url=https://facilitator.example
+```
+
+It builds a payment payload with the same `@x402/evm` client an agent uses, posts it to `/verify` and `/settle`, and then asserts the thing this whole service exists to do:
+
+> the payer's native balance falls by exactly `amount × 10^12`, and not one wei more.
+
+That is the Arc-shaped version of "gasless". On a chain with a separate gas token you would assert the payer holds none of it — which only ever proved they had nothing to lose. Here the payer necessarily holds the gas token, because it is the same USDC they are spending, so the assertion is arithmetic instead: any gas charged to the payer would show up as that extra wei. See [what is x402](/docs/what-is-x402).
 
 ## Changing the allowlist
 
