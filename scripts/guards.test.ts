@@ -14,11 +14,11 @@ import assert from "node:assert/strict";
 process.env.MIN_AMOUNT_BASE_UNITS = "10000";
 process.env.MAINNET_ENABLED = "false";
 process.env.RATE_LIMIT_IP_PER_MIN = "3";
-process.env.RATE_LIMIT_PAYER_PER_MIN = "1000";
+process.env.RATE_LIMIT_PAYER_PER_MIN = "2";
 process.env.RATE_LIMIT_PAYTO_PER_MIN = "1000";
 process.env.RATE_LIMIT_GLOBAL_PER_MIN = "1000";
 
-const { preflight, resetRateLimits, clientIp } = await import("../lib/guards");
+const { preflight, resetRateLimits, clientIp, readConfig } = await import("../lib/guards");
 const { NETWORKS, findAsset } = await import("../lib/networks");
 const { safeErrorMessage } = await import("../lib/redact");
 
@@ -168,6 +168,76 @@ await check("rate limits are per IP, not global", async () => {
 
 // No FACILITATOR_PRIVATE_KEY in this run, so the signer cannot be read. Settle
 // must refuse with a clear 503 rather than throw.
+// The per-payer limit existed in the config and in the docs but nothing ever
+// passed `payer`, so it never fired. The address comes from the signed payload,
+// not a header, which is why it is the one bucket a caller cannot rotate.
+await check("the per-payer rate limit trips across different IPs", async () => {
+  resetRateLimits();
+  const payer = "0x3333333333333333333333333333333333333333";
+  for (let i = 0; i < 2; i += 1) {
+    const result = await preflight({ ...base, ip: `198.51.100.6${i}`, payer });
+    assert.equal(result.kind, "ok", `request ${i + 1} should pass`);
+  }
+  const limited = await preflight({ ...base, ip: "198.51.100.69", payer });
+  assert.equal(limited.kind, "http");
+  assert.equal(limited.kind === "http" && limited.reason, "rate_limited");
+
+  // A different payer on a fresh IP is unaffected.
+  const other = await preflight({ ...base, ip: "198.51.100.70", payer: "0x4444444444444444444444444444444444444444" });
+  assert.equal(other.kind, "ok");
+});
+
+await check("a payload with no usable payer is not bucketed under a junk key", async () => {
+  const { payerOf } = await import("../lib/facilitator-http");
+  assert.equal(payerOf({ payload: { authorization: { from: MERCHANT } } } as never), MERCHANT);
+  assert.equal(payerOf({ payload: { authorization: { from: "not-an-address" } } } as never), undefined);
+  assert.equal(payerOf({} as never), undefined);
+});
+
+// A blank line in a .env — RATE_LIMIT_IP_PER_MIN= — used to read as Number(""),
+// which is 0, which `hit()` treats as "no limit". The dust floor went the same
+// way via BigInt(""), and MIN_SIGNER_BALANCE_USDC= threw inside parseEther at
+// import time, taking /verify, /settle and /health down with it.
+await check("blank or unusable environment values fall back instead of disabling a guard", () => {
+  const blank = readConfig({
+    RATE_LIMIT_IP_PER_MIN: "",
+    RATE_LIMIT_GLOBAL_PER_MIN: "   ",
+    MIN_AMOUNT_BASE_UNITS: "",
+    MAX_SETTLE_GAS: "",
+    MIN_SIGNER_BALANCE_USDC: "",
+  });
+  assert.equal(blank.rateLimit.ip, 120);
+  assert.equal(blank.rateLimit.global, 1200);
+  assert.equal(blank.minAmountBaseUnits, 10_000n);
+  assert.equal(blank.maxSettleGas, 300_000n);
+  assert.ok(blank.minSignerBalanceWei > 0n);
+
+  const junk = readConfig({
+    RATE_LIMIT_IP_PER_MIN: "abc",
+    RATE_LIMIT_PAYER_PER_MIN: "-5",
+    MIN_AMOUNT_BASE_UNITS: "0.01",
+    MIN_SIGNER_BALANCE_USDC: "not-a-number",
+  });
+  assert.equal(junk.rateLimit.ip, 120);
+  assert.equal(junk.rateLimit.payer, 30, "a negative limit must not read as off");
+  assert.equal(junk.minAmountBaseUnits, 10_000n);
+  assert.equal(junk.minSignerBalanceWei, readConfig({}).minSignerBalanceWei);
+
+  // An explicit 0 is a deliberate "off" and is still honoured.
+  assert.equal(readConfig({ RATE_LIMIT_IP_PER_MIN: "0" }).rateLimit.ip, 0);
+});
+
+// With the floor configurable down to 0, nothing else was left to reject a
+// zero or negative amount.
+await check("a non-positive amount is rejected whatever the floor is set to", async () => {
+  resetRateLimits();
+  for (const amount of ["0", "-10000"]) {
+    const result = await preflight({ ...base, ip: "198.51.100.80", amount });
+    assert.equal(result.kind, "reject", `${amount} should be rejected`);
+    assert.equal(result.kind === "reject" && result.reason, "invalid_amount");
+  }
+});
+
 await check("settle refuses when the signer is unavailable", async () => {
   resetRateLimits();
   const result = await preflight({ ...base, phase: "settle", ip: "198.51.100.20" });
@@ -288,6 +358,70 @@ await check("bazaar registration input is validated", () => {
   assert.equal(ok.input.website, "https://acme.example");
   assert.equal(ok.input.payTo, MERCHANT.toLowerCase());
   assert.deepEqual(ok.input.endpoints[1], { url: "https://acme.example/x402/report", method: "POST" });
+});
+
+// `new URL()` normalises the host, so a dotted-quad regex never saw the hex form
+// of an IPv4-mapped address. ::ffff:7f00:1 is 127.0.0.1 and ::ffff:a9fe:a9fe is
+// the cloud metadata service.
+await check("bazaar refuses every spelling of an IPv4-mapped or tunnelled address", () => {
+  for (const ip of [
+    "::ffff:7f00:1",
+    "::FFFF:A9FE:A9FE",
+    "::ffff:0a00:0001",
+    "::ffff:ac10:1",
+    "64:ff9b::7f00:1",
+    "2002:7f00:1::",
+    "2001:0:1234::1",
+    "::",
+    "not-an-ip",
+  ]) {
+    assert.equal(bazaar.isPublicIp(ip), false, `${ip} should be refused`);
+  }
+  assert.equal(bazaar.isPublicIp("2a00:1450:4001:800::200e"), true);
+});
+
+await check("bazaar refuses a route template, which could never answer a 402", async () => {
+  assert.equal(bazaar.isTemplatedUrl(new URL("https://acme.example/items/{id}")), true);
+  assert.equal(bazaar.isTemplatedUrl(new URL("https://acme.example/items/%7Bid%7D")), true);
+  assert.equal(bazaar.isTemplatedUrl(new URL("https://acme.example/items/42")), false);
+  assert.ok("error" in (await bazaar.safeTarget("https://acme.example/items/{id}")));
+});
+
+// Registration is unauthenticated, so the verbs we are willing to aim at a
+// stranger's URL are limited to the two a paid x402 route actually uses.
+await check("bazaar will not be asked to send a mutating request", () => {
+  for (const method of ["DELETE", "PUT", "PATCH"]) {
+    assert.ok(
+      "error" in bazaar.parseRegistration({ payTo: MERCHANT, endpoints: [{ url: "https://a.example/x", method }] }),
+      `${method} should be refused`,
+    );
+  }
+  assert.ok("input" in bazaar.parseRegistration({ payTo: MERCHANT, endpoints: [{ url: "https://a.example/x", method: "post" }] }));
+});
+
+// The hijack this closes: name a competitor's endpoint, claim your own address,
+// and their verified listing is re-pointed and reset to pending.
+await check("a verified listing cannot be claimed by another pay-to", () => {
+  const MERCHANT_B = "0x2222222222222222222222222222222222222222";
+  const verified = { pay_to: MERCHANT, status: "verified" as const };
+  assert.equal(bazaar.mayClaim(verified, MERCHANT_B), false);
+  assert.equal(bazaar.mayClaim(verified, MERCHANT), true, "the owner may still refresh its own row");
+  assert.equal(bazaar.mayClaim(undefined, MERCHANT_B), true, "a new endpoint is anyone's to register");
+  for (const status of ["pending", "mismatch", "unreachable"] as const) {
+    assert.equal(bazaar.mayClaim({ pay_to: MERCHANT, status }, MERCHANT_B), true, `${status} is not owned`);
+  }
+});
+
+// One timeout used to delist a live merchant, and the daily sweep only looked at
+// verified rows, so it was never retried.
+await check("a transient failure is retried; a verdict is not", () => {
+  for (const detail of ["timed out after 5s", "request failed", "expected HTTP 402, got 503"]) {
+    assert.equal(bazaar.isTransientFailure({ status: "unreachable", detail }), true, detail);
+  }
+  for (const detail of ["expected HTTP 402, got 404", "402 has no PAYMENT-REQUIRED header", "only https:// endpoints can be listed"]) {
+    assert.equal(bazaar.isTransientFailure({ status: "unreachable", detail }), false, detail);
+  }
+  assert.equal(bazaar.isTransientFailure({ status: "mismatch", detail: "timed out after 5s" }), false);
 });
 
 console.log(`\n${passed} checks passed.`);

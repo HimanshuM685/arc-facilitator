@@ -46,11 +46,25 @@ const host = (website: string | null) => {
   }
 };
 
-/** "0.01 USDC on Arc Testnet" from an x402 accepts entry. */
+/**
+ * "0.01 USDC on Arc Testnet" from an x402 accepts entry.
+ *
+ * `accepts` is copied from a merchant's own 402 header, so every field here is a
+ * stranger's string. `BigInt("12.5")` throws, and an uncaught throw in render
+ * blanks the whole merchant page — so an amount that will not parse is shown
+ * verbatim instead of formatted.
+ */
 function price(a: Accept): string {
   const net = networkByCaip2(a.network);
   const asset = net ? findAsset(net.key, a.asset) : undefined;
-  const value = asset ? formatUnits(BigInt(a.amount), asset.decimals) : a.amount;
+  let value = String(a.amount ?? "");
+  if (asset) {
+    try {
+      value = formatUnits(BigInt(a.amount), asset.decimals);
+    } catch {
+      return `${value} base units${net ? ` on ${net.name}` : ""}`;
+    }
+  }
   return `${value} ${asset?.symbol ?? "units"}${net ? ` on ${net.name}` : ""}`;
 }
 

@@ -14,7 +14,7 @@ export const dynamic = "force-dynamic";
 export async function POST(request: NextRequest) {
   const parsed = await parseFacilitatorRequest(request);
   if ("error" in parsed) return parsed.error;
-  const { net, payload, requirements, ip } = parsed;
+  const { net, payload, requirements, ip, payer } = parsed;
 
   const gate = await preflight({
     net,
@@ -25,6 +25,7 @@ export async function POST(request: NextRequest) {
     asset: requirements.asset,
     amount: requirements.amount,
     payTo: requirements.payTo,
+    payer,
   });
 
   if (gate.kind !== "ok") {

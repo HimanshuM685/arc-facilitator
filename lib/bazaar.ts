@@ -13,7 +13,7 @@
  */
 
 import { lookup } from "node:dns/promises";
-import { isIP } from "node:net";
+import { BlockList, isIP } from "node:net";
 import { after } from "next/server";
 import { isAddress } from "viem";
 import type { PaymentPayload, PaymentRequired, PaymentRequirements } from "@x402/core/types";
@@ -43,30 +43,54 @@ const ALLOW_PRIVATE = process.env.BAZAAR_ALLOW_PRIVATE_TARGETS === "true";
  * Outbound-call safety (we fetch URLs supplied by strangers)
  * ------------------------------------------------------------------ */
 
+/**
+ * Addresses we refuse to call.
+ *
+ * `net.BlockList` rather than hand-rolled string matching, because it normalises
+ * IPv4-mapped IPv6 before applying the IPv4 rules: `::ffff:127.0.0.1` and its
+ * hex form `::ffff:7f00:1` both match `127.0.0.0/8` here. A regex on the dotted
+ * form only caught the first, which is a one-line bypass straight to loopback
+ * and to cloud metadata at 169.254.169.254.
+ */
+const BLOCKED = new BlockList();
+BLOCKED.addSubnet("0.0.0.0", 8, "ipv4"); // "this network"
+BLOCKED.addSubnet("10.0.0.0", 8, "ipv4"); // private
+BLOCKED.addSubnet("100.64.0.0", 10, "ipv4"); // CGNAT
+BLOCKED.addSubnet("127.0.0.0", 8, "ipv4"); // loopback
+BLOCKED.addSubnet("169.254.0.0", 16, "ipv4"); // link-local / cloud metadata
+BLOCKED.addSubnet("172.16.0.0", 12, "ipv4"); // private
+BLOCKED.addSubnet("192.0.0.0", 16, "ipv4"); // IETF assignments, TEST-NET-1
+BLOCKED.addSubnet("192.168.0.0", 16, "ipv4"); // private
+BLOCKED.addSubnet("198.18.0.0", 15, "ipv4"); // benchmarking
+BLOCKED.addSubnet("224.0.0.0", 3, "ipv4"); // multicast and reserved (224-255)
+// Inside global unicast, but able to carry an embedded IPv4 address.
+BLOCKED.addSubnet("2001::", 32, "ipv6"); // Teredo
+BLOCKED.addSubnet("2001:db8::", 32, "ipv6"); // documentation
+BLOCKED.addSubnet("2002::", 16, "ipv6"); // 6to4
+
+/**
+ * Global unicast, the only IPv6 we will call. An allowlist rather than a
+ * blocklist on purpose: loopback, link-local, ULA, NAT64 and every spelling of
+ * an IPv4-mapped address sit outside 2000::/3, so they are refused without
+ * having to be enumerated.
+ */
+const GLOBAL_UNICAST_V6 = new BlockList();
+GLOBAL_UNICAST_V6.addSubnet("2000::", 3, "ipv6");
+
 /** True for addresses on the public internet; false for loopback, private, link-local, CGNAT, etc. */
 export function isPublicIp(ip: string): boolean {
   const kind = isIP(ip);
-  if (kind === 4) {
-    const [a, b] = ip.split(".").map(Number) as [number, number];
-    if (a === 0 || a === 10 || a === 127 || a >= 224) return false;
-    if (a === 100 && b >= 64 && b <= 127) return false; // CGNAT
-    if (a === 169 && b === 254) return false; // link-local / cloud metadata
-    if (a === 172 && b >= 16 && b <= 31) return false;
-    if (a === 192 && (b === 168 || b === 0)) return false;
-    if (a === 198 && (b === 18 || b === 19)) return false; // benchmarking
-    return true;
-  }
-  if (kind === 6) {
-    const lower = ip.toLowerCase();
-    const mapped = lower.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-    if (mapped) return isPublicIp(mapped[1]!);
-    if (lower === "::" || lower === "::1") return false;
-    if (/^f[cd]/.test(lower)) return false; // unique local fc00::/7
-    if (/^fe[89ab]/.test(lower)) return false; // link-local fe80::/10
-    return true;
-  }
+  if (kind === 4) return !BLOCKED.check(ip, "ipv4");
+  if (kind === 6) return !BLOCKED.check(ip, "ipv6") && GLOBAL_UNICAST_V6.check(ip, "ipv6");
   return false;
 }
+
+/**
+ * A route template such as `/items/{id}`, which `new URL()` leaves as
+ * `/items/%7Bid%7D`. Such a URL can never answer a 402, so storing it would
+ * create a row that is permanently unverifiable and points nowhere.
+ */
+export const isTemplatedUrl = (url: URL): boolean => /%7b|%7d|[{}]/i.test(`${url.pathname}${url.search}`);
 
 /** Parses a merchant-supplied URL and refuses anything we should not call. */
 export async function safeTarget(raw: string): Promise<{ url: URL } | { error: string }> {
@@ -77,6 +101,7 @@ export async function safeTarget(raw: string): Promise<{ url: URL } | { error: s
     return { error: "not a valid URL" };
   }
   if (url.username || url.password) return { error: "URL must not carry credentials" };
+  if (isTemplatedUrl(url)) return { error: "URL is a route template, not a concrete endpoint" };
   if (url.protocol !== "https:" && !(ALLOW_PRIVATE && url.protocol === "http:")) {
     return { error: "only https:// endpoints can be listed" };
   }
@@ -117,14 +142,11 @@ export function matchPayTo(paymentRequired: PaymentRequired, payTo: string): Che
   return { status: "verified", detail: "live 402 pays the claimed address", paymentRequired, network: hit.network };
 }
 
-/** Calls the endpoint and checks its live 402 against the claimed pay-to. */
-export async function verifyEndpoint(rawUrl: string, method: string, payTo: string): Promise<CheckResult> {
-  const target = await safeTarget(rawUrl);
-  if ("error" in target) return { status: "unreachable", detail: target.error };
-
+/** One request: does this URL answer with a 402 that pays `payTo`? */
+async function probe(url: URL, method: string, payTo: string): Promise<CheckResult> {
   let response: Response;
   try {
-    response = await fetch(target.url, {
+    response = await fetch(url, {
       method,
       redirect: "manual",
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
@@ -153,6 +175,30 @@ export async function verifyEndpoint(rawUrl: string, method: string, payTo: stri
   return matchPayTo(paymentRequired, payTo);
 }
 
+/**
+ * Outcomes worth a second attempt. A timeout, a dropped connection or a 5xx says
+ * something about this moment, not about the endpoint — and a verified merchant
+ * should not be delisted by one of them. A `mismatch`, a 404 or a malformed
+ * header is a verdict, and repeating the call would only waste a request.
+ */
+const RETRYABLE = /timed out|request failed|got 5\d\d/;
+const RETRY_DELAY_MS = 1_000;
+
+/** True when an `unreachable` verdict is about this moment rather than the endpoint. */
+export const isTransientFailure = (result: CheckResult): boolean =>
+  result.status === "unreachable" && RETRYABLE.test(result.detail);
+
+/** Calls the endpoint and checks its live 402 against the claimed pay-to. */
+export async function verifyEndpoint(rawUrl: string, method: string, payTo: string): Promise<CheckResult> {
+  const target = await safeTarget(rawUrl);
+  if ("error" in target) return { status: "unreachable", detail: target.error };
+
+  const first = await probe(target.url, method, payTo);
+  if (!isTransientFailure(first)) return first;
+  await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+  return probe(target.url, method, payTo);
+}
+
 /* ------------------------------------------------------------------ *
  * Catalog writes
  * ------------------------------------------------------------------ */
@@ -169,47 +215,52 @@ type EndpointRow = {
 
 const inFlight = new Set<string>();
 
+/** Writes a check outcome onto one row. Throws only if the database does. */
+async function storeCheck(id: string, result: CheckResult): Promise<void> {
+  const pr = result.paymentRequired;
+  const meta = pr?.resource ? sanitizeResourceServiceMetadata(pr.resource) : {};
+  const discovery = (pr?.extensions as Record<string, unknown> | undefined)?.bazaar ?? null;
+
+  await db().query(
+    `update bazaar_endpoints set
+       status = $2,
+       status_detail = $3,
+       last_checked_at = now(),
+       settles_since_check = 0,
+       verified_at = case when $2 = 'verified' then now() else verified_at end,
+       network = coalesce($4, network),
+       accepts = coalesce($5::jsonb, accepts),
+       service_name = coalesce($6, service_name),
+       icon_url = coalesce($7, icon_url),
+       tags = coalesce($8, tags),
+       description = coalesce($9, description),
+       mime_type = coalesce($10, mime_type),
+       discovery = coalesce($11::jsonb, discovery),
+       updated_at = now()
+     where id = $1`,
+    [
+      id,
+      result.status,
+      result.detail,
+      result.network ?? null,
+      result.status === "verified" && pr ? JSON.stringify(pr.accepts.filter((a) => networkByCaip2(a.network))) : null,
+      meta.serviceName ?? null,
+      meta.iconUrl ?? null,
+      meta.tags ?? null,
+      pr?.resource?.description?.slice(0, 500) ?? null,
+      pr?.resource?.mimeType?.slice(0, 100) ?? null,
+      discovery ? JSON.stringify(discovery) : null,
+    ],
+  );
+}
+
 /** Runs a check and stores the outcome. Never throws. */
 async function checkAndStore(id: string, url: string, method: string, payTo: string): Promise<CheckResult | null> {
   if (inFlight.has(id)) return null;
   inFlight.add(id);
   try {
     const result = await verifyEndpoint(url, method, payTo);
-    const pr = result.paymentRequired;
-    const meta = pr?.resource ? sanitizeResourceServiceMetadata(pr.resource) : {};
-    const discovery = (pr?.extensions as Record<string, unknown> | undefined)?.bazaar ?? null;
-
-    await db().query(
-      `update bazaar_endpoints set
-         status = $2,
-         status_detail = $3,
-         last_checked_at = now(),
-         settles_since_check = 0,
-         verified_at = case when $2 = 'verified' then now() else verified_at end,
-         network = coalesce($4, network),
-         accepts = coalesce($5::jsonb, accepts),
-         service_name = coalesce($6, service_name),
-         icon_url = coalesce($7, icon_url),
-         tags = coalesce($8, tags),
-         description = coalesce($9, description),
-         mime_type = coalesce($10, mime_type),
-         discovery = coalesce($11::jsonb, discovery),
-         updated_at = now()
-       where id = $1`,
-      [
-        id,
-        result.status,
-        result.detail,
-        result.network ?? null,
-        result.status === "verified" && pr ? JSON.stringify(pr.accepts.filter((a) => networkByCaip2(a.network))) : null,
-        meta.serviceName ?? null,
-        meta.iconUrl ?? null,
-        meta.tags ?? null,
-        pr?.resource?.description?.slice(0, 500) ?? null,
-        pr?.resource?.mimeType?.slice(0, 100) ?? null,
-        discovery ? JSON.stringify(discovery) : null,
-      ],
-    );
+    await storeCheck(id, result);
     return result;
   } catch (error) {
     console.error("[bazaar] check failed:", (error as Error).message);
@@ -236,6 +287,20 @@ const needsCheck = (row: EndpointRow | undefined, payTo: string) =>
   !row.last_checked_at ||
   Date.now() - new Date(row.last_checked_at).getTime() > RECHECK_AFTER_MS;
 
+/**
+ * Who is allowed to write to an existing catalog row.
+ *
+ * A verified row belongs to the pay-to whose live 402 proved it. Nobody else
+ * gets to re-point it or reset its status, through either door into
+ * `upsertEndpoint`: `payTo` comes from a registration body or from a
+ * settlement's requirements, and the resource URL in both is chosen by the
+ * caller. Without this, anyone could name a competitor's endpoint, claim their
+ * own address, and delist that merchant until its next re-check.
+ */
+export function mayClaim(row: { pay_to: string; status: EndpointStatus } | undefined, payTo: string): boolean {
+  return !row || row.pay_to === payTo || row.status !== "verified";
+}
+
 async function upsertEndpoint(fields: {
   url: string;
   method: string;
@@ -248,14 +313,18 @@ async function upsertEndpoint(fields: {
   iconUrl?: string;
   discovery?: unknown;
   countSettle: boolean;
-}): Promise<{ id: string; check: boolean }> {
+}): Promise<{ id: string; check: boolean } | { conflict: string }> {
   await ensureSchema();
   const existing = (await db().query(
     `select id::text, resource_url, method, pay_to, status, last_checked_at::text, settles_since_check
        from bazaar_endpoints where resource_url = $1 and method = $2`,
     [fields.url, fields.method],
   )) as EndpointRow[];
-  const check = needsCheck(existing[0], fields.payTo);
+  const row = existing[0];
+  if (!mayClaim(row, fields.payTo)) {
+    return { conflict: "another pay-to is already verified for this endpoint" };
+  }
+  const check = needsCheck(row, fields.payTo);
 
   const rows = (await db().query(
     `insert into bazaar_endpoints
@@ -305,13 +374,16 @@ export async function recordSettle(payload: PaymentPayload, requirements: Paymen
     if (!rawUrl) return;
     const url = new URL(rawUrl);
     if (url.protocol !== "https:" && !ALLOW_PRIVATE) return;
+    // A paid resource declared as a route template (`/items/{id}`) is not an
+    // address we can call, so there is nothing here worth cataloguing.
+    if (isTemplatedUrl(url)) return;
 
     const payTo = requirements.payTo.toLowerCase();
     const method = (discovered && "method" in discovered && discovered.method) || "GET";
     const meta = sanitizeResourceServiceMetadata(payload.resource);
     const bazaar = (payload.extensions as Record<string, unknown> | undefined)?.bazaar;
 
-    const { id, check } = await upsertEndpoint({
+    const stored = await upsertEndpoint({
       url: `${url.origin}${url.pathname}`,
       method: method.toUpperCase(),
       payTo,
@@ -322,11 +394,19 @@ export async function recordSettle(payload: PaymentPayload, requirements: Paymen
       discovery: bazaar,
       countSettle: true,
     });
-    if (check) background(() => checkAndStore(id, `${url.origin}${url.pathname}`, method.toUpperCase(), payTo));
+    // Someone else's endpoint, already verified for them: the payment stands,
+    // it just does not re-label their listing.
+    if ("conflict" in stored) return;
+    if (stored.check) {
+      background(() => checkAndStore(stored.id, `${url.origin}${url.pathname}`, method.toUpperCase(), payTo));
+    }
   } catch (error) {
     console.error("[bazaar] could not record settle:", (error as Error).message);
   }
 }
+
+/** The only methods we will send to a stranger's URL. */
+export const PROBE_METHODS: readonly string[] = ["GET", "POST"];
 
 export type RegisterInput = {
   payTo: string;
@@ -358,7 +438,13 @@ export function parseRegistration(body: unknown): { error: string } | { input: R
       ? String((e as { method: string }).method).toUpperCase()
       : "GET";
     if (typeof url !== "string" || url.length > 2048) return { error: "Each endpoint needs a `url` string." };
-    if (!["GET", "POST", "PUT", "PATCH", "DELETE"].includes(method)) return { error: `Unsupported method ${method}.` };
+    // Registration is unauthenticated and makes us call a URL a stranger chose,
+    // so the verbs we are willing to send are limited to the two an x402 paid
+    // route realistically uses. PUT/PATCH/DELETE would turn this endpoint into a
+    // way to aim mutating requests at any host on the internet from our IP.
+    if (!PROBE_METHODS.includes(method)) {
+      return { error: `Only ${PROBE_METHODS.join(" and ")} endpoints can be registered, not ${method}.` };
+    }
     endpoints.push({ url, method });
   }
   const name = typeof b.name === "string" && isValidServiceName(b.name) ? b.name : "";
@@ -374,47 +460,99 @@ export function parseRegistration(body: unknown): { error: string } | { input: R
   return { input: { payTo: b.payTo.toLowerCase(), name, website, endpoints } };
 }
 
-/** The merchant's own code tells us: "this is my pay-to, these are my x402 endpoints". */
+/** Records a check outcome on a row this pay-to already holds. A no-op otherwise. */
+async function refreshOwnEndpoint(url: string, method: string, payTo: string, result: CheckResult): Promise<void> {
+  const rows = (await db().query(
+    `select id::text from bazaar_endpoints where resource_url = $1 and method = $2 and pay_to = $3`,
+    [url, method, payTo],
+  )) as { id: string }[];
+  if (rows[0]) await storeCheck(rows[0].id, result);
+}
+
+/**
+ * The merchant's own code tells us: "this is my pay-to, these are my x402
+ * endpoints".
+ *
+ * Nothing a registration claims is written before the endpoint's live 402 has
+ * proved it. This endpoint is unauthenticated — there is no way to establish
+ * that the caller controls `payTo`, so the endpoint itself has to be the proof.
+ * A claim that does not verify leaves the catalog exactly as it was, including
+ * every other merchant's listing.
+ */
 export async function registerMerchant(input: Required<RegisterInput>): Promise<RegisterResult> {
   await ensureSchema();
-  await db().query(
-    `insert into bazaar_merchants (pay_to, name, website) values ($1, nullif($2, ''), nullif($3, ''))
-     on conflict (pay_to) do update set
-       name = coalesce(nullif($2, ''), bazaar_merchants.name),
-       website = coalesce(nullif($3, ''), bazaar_merchants.website),
-       updated_at = now()`,
-    [input.payTo, input.name, input.website],
-  );
 
   const endpoints = await Promise.all(
     input.endpoints.map(async (entry) => {
       const { url: raw, method } = typeof entry === "string" ? { url: entry, method: "GET" } : { method: "GET", ...entry };
       const target = await safeTarget(raw);
-      if ("error" in target) return { url: raw, method, status: "unreachable" as const, detail: target.error };
+      if ("error" in target) return { url: raw, method: method!, status: "unreachable" as const, detail: target.error };
       const url = `${target.url.origin}${target.url.pathname}`;
-      const { id } = await upsertEndpoint({ url, method: method!, payTo: input.payTo, source: "register", countSettle: false });
-      const result = await checkAndStore(id, url, method!, input.payTo);
-      return {
+
+      const result = await verifyEndpoint(url, method!, input.payTo);
+      if (result.status !== "verified") {
+        // An unproven claim gets no row of its own and may not touch anyone
+        // else's; the merchant's own rows are still refreshed, so a listing that
+        // has stopped answering correctly drops out.
+        await refreshOwnEndpoint(url, method!, input.payTo, result);
+        return { url, method: method!, status: result.status, detail: result.detail };
+      }
+
+      const stored = await upsertEndpoint({
         url,
         method: method!,
-        status: result?.status ?? ("pending" as const),
-        detail: result?.detail ?? "check already in progress",
-      };
+        payTo: input.payTo,
+        source: "register",
+        countSettle: false,
+      });
+      if ("conflict" in stored) return { url, method: method!, status: "mismatch" as const, detail: stored.conflict };
+      await storeCheck(stored.id, result);
+      return { url, method: method!, status: result.status, detail: result.detail };
     }),
   );
 
+  // Name and website are profile text nothing on-chain can corroborate, so they
+  // are taken only from a caller that has just proved it controls an endpoint
+  // paying this address. Otherwise anyone could rewrite any merchant's card.
+  const proved = endpoints.some((e) => e.status === "verified");
+  if (proved && (input.name || input.website)) {
+    await db().query(
+      `insert into bazaar_merchants (pay_to, name, website) values ($1, nullif($2, ''), nullif($3, ''))
+       on conflict (pay_to) do update set
+         name = coalesce(nullif($2, ''), bazaar_merchants.name),
+         website = coalesce(nullif($3, ''), bazaar_merchants.website),
+         updated_at = now()`,
+      [input.payTo, input.name, input.website],
+    );
+  }
+
   return {
-    merchant: { payTo: input.payTo, name: input.name || null, website: input.website || null },
+    merchant: {
+      payTo: input.payTo,
+      name: (proved && input.name) || null,
+      website: (proved && input.website) || null,
+    },
     endpoints,
   };
 }
 
-/** Re-checks a few verified endpoints that have gone a day without a check. Cheap; called on reads. */
+/**
+ * Re-checks a few endpoints that are due. Cheap; called on reads.
+ *
+ * Failures are picked up too, on a shorter interval. A verified endpoint knocked
+ * to `unreachable` by one bad minute would otherwise never be looked at again,
+ * because this sweep only considered verified rows — so a momentary blip delisted
+ * a live merchant permanently. `mismatch` is left out on purpose: that is a
+ * verdict about what the endpoint's own 402 says, and it is re-checked when the
+ * merchant registers again or a payment for it settles.
+ */
 export function refreshStale(limit = 5): void {
   background(async () => {
     const rows = (await db().query(
       `select id::text, resource_url, method, pay_to from bazaar_endpoints
-        where status = 'verified' and (last_checked_at is null or last_checked_at < now() - interval '1 day')
+        where (status = 'verified' and (last_checked_at is null or last_checked_at < now() - interval '1 day'))
+           or (status in ('unreachable', 'pending')
+               and (last_checked_at is null or last_checked_at < now() - interval '1 hour'))
         order by last_checked_at nulls first limit $1`,
       [limit],
     )) as Pick<EndpointRow, "id" | "resource_url" | "method" | "pay_to">[];

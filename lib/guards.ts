@@ -17,36 +17,84 @@ import { parseEther } from "viem";
 import { facilitatorAccount, publicClientFor } from "./chain";
 import { findAsset, NETWORKS, type AssetDef, type NetworkKey } from "./networks";
 
-const num = (name: string, fallback: number): number => {
-  const raw = process.env[name];
-  const parsed = raw === undefined ? NaN : Number(raw);
-  return Number.isFinite(parsed) ? parsed : fallback;
+/** Just the shape `readConfig` needs, so a test can hand it a plain object. */
+type Env = Record<string, string | undefined>;
+
+/**
+ * An environment variable, with blank treated as absent.
+ *
+ * This matters more than it looks. A `.env` line left as `RATE_LIMIT_IP_PER_MIN=`
+ * used to read as `Number("")`, which is `0`, which `hit()` treats as "no limit"
+ * — a guard silently switched off by an empty value. `MIN_AMOUNT_BASE_UNITS=`
+ * became `BigInt("")`, also `0`, removing the dust floor.
+ */
+const envValue = (env: Env, name: string): string | undefined => {
+  const value = env[name]?.trim();
+  return value ? value : undefined;
 };
 
 /**
- * Reads a USDC amount from the environment into 18-decimal native units.
- * `parseEther` is right here, not `parseUnits(..., 6)`: the value is compared
- * against `getBalance`, which on Arc returns the native (18-decimal) view of
- * the signer's USDC. See `toViemChain` in lib/chain.ts.
+ * Falls back rather than throwing. A bad value should not be able to take
+ * /verify, /settle and /health down at import time — `parseEther("")` threw, so
+ * a single stray character in the deployment's environment was an outage. The
+ * fallback is always the safe side of the limit it replaces.
  */
-const usdc = (name: string, fallback: string): bigint => parseEther(process.env[name] ?? fallback);
+function envOr<T>(
+  env: Env,
+  name: string,
+  fallback: T,
+  parse: (raw: string) => T,
+  valid: (value: T) => boolean,
+): T {
+  const raw = envValue(env, name);
+  if (raw === undefined) return fallback;
+  try {
+    const parsed = parse(raw);
+    if (!valid(parsed)) throw new Error("out of range");
+    return parsed;
+  } catch {
+    console.warn(`[guards] ${name}="${raw}" is not usable; falling back to ${fallback}.`);
+    return fallback;
+  }
+}
 
-export const config = {
-  mainnetEnabled: process.env.MAINNET_ENABLED === "true",
-  // 6-decimal base units, matching a payment `amount`. The default 10000 is
-  // 0.01 USDC. On Arc that floor is directly comparable to the gas it guards
-  // against, because both sides are USDC: a settle costs ~0.0017-0.0022 USDC
-  // (70-90k gas at Arc's 20 Gwei minimum base fee), so 0.01 clears it ~5x.
-  minAmountBaseUnits: BigInt(process.env.MIN_AMOUNT_BASE_UNITS ?? "10000"),
-  maxSettleGas: BigInt(process.env.MAX_SETTLE_GAS ?? "300000"),
-  rateLimit: {
-    ip: num("RATE_LIMIT_IP_PER_MIN", 120),
-    payer: num("RATE_LIMIT_PAYER_PER_MIN", 30),
-    payTo: num("RATE_LIMIT_PAYTO_PER_MIN", 120),
-    global: num("RATE_LIMIT_GLOBAL_PER_MIN", 1200),
-  },
-  minSignerBalanceWei: usdc("MIN_SIGNER_BALANCE_USDC", "0.05"),
-} as const;
+/**
+ * The whole configuration, read from an environment. Takes `env` as an argument
+ * so the fallback behaviour above is testable without a subprocess.
+ */
+export function readConfig(env: Env = process.env) {
+  /** A rate limit in requests per minute. 0 is a deliberate "off"; negative is not. */
+  const num = (name: string, fallback: number) =>
+    envOr(env, name, fallback, Number, (v) => Number.isFinite(v) && v >= 0);
+  /** A count in base units — a payment amount or a gas ceiling. Never negative. */
+  const count = (name: string, fallback: bigint) => envOr(env, name, fallback, BigInt, (v) => v >= 0n);
+  /**
+   * A USDC amount in 18-decimal native units. `parseEther`, not
+   * `parseUnits(..., 6)`: it is compared against `getBalance`, which on Arc
+   * returns the native view of the signer's USDC. See `toViemChain` in chain.ts.
+   */
+  const usdc = (name: string, fallback: string) =>
+    envOr(env, name, parseEther(fallback), parseEther, (v) => v >= 0n);
+
+  return {
+    mainnetEnabled: env.MAINNET_ENABLED === "true",
+    // 6-decimal base units, matching a payment `amount`. The default 10000 is
+    // 0.01 USDC. On Arc that floor is directly comparable to the gas it guards
+    // against, because both sides are USDC: a settle costs ~0.0017-0.0022 USDC
+    // (70-90k gas at Arc's 20 Gwei minimum base fee), so 0.01 clears it ~5x.
+    minAmountBaseUnits: count("MIN_AMOUNT_BASE_UNITS", 10_000n),
+    maxSettleGas: count("MAX_SETTLE_GAS", 300_000n),
+    rateLimit: {
+      ip: num("RATE_LIMIT_IP_PER_MIN", 120),
+      payer: num("RATE_LIMIT_PAYER_PER_MIN", 30),
+      payTo: num("RATE_LIMIT_PAYTO_PER_MIN", 120),
+      global: num("RATE_LIMIT_GLOBAL_PER_MIN", 1200),
+    },
+    minSignerBalanceWei: usdc("MIN_SIGNER_BALANCE_USDC", "0.05"),
+  } as const;
+}
+
+export const config = readConfig();
 
 /* ------------------------------------------------------------------ *
  * Rate limiting
@@ -170,6 +218,12 @@ export async function preflight(input: PreflightInput): Promise<PreflightResult>
     amount = BigInt(input.amount);
   } catch {
     return { kind: "reject", reason: "invalid_amount", message: `Amount "${input.amount}" is not an integer.` };
+  }
+
+  // Independent of the floor, which an operator can set to 0: zero or negative
+  // is not a payment at all, whatever the configuration says.
+  if (amount <= 0n) {
+    return { kind: "reject", reason: "invalid_amount", message: `Amount "${input.amount}" is not a positive integer.` };
   }
 
   if (amount < config.minAmountBaseUnits) {

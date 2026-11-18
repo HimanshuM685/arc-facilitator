@@ -112,9 +112,11 @@ We call each endpoint immediately and tell you which ones made it:
 
 Call it again any time, say on deploy, to re-check everything. Rules:
 
-- Endpoints must be public `https://` URLs. Up to 25 per call.
-- `status` is `verified` (listed), `mismatch` (its 402 pays another address or another chain) or `unreachable` (no answer, not a `402`, or no valid `PAYMENT-REQUIRED` header).
+- Endpoints must be public `https://` URLs, `GET` or `POST`, up to 25 per call. A route template (`/items/{id}`) is refused: we have to call a concrete URL to see its 402.
+- `status` is `verified` (listed), `mismatch` (its 402 pays another address or another chain, or another pay-to is already verified for that exact URL and method) or `unreachable` (no answer, not a `402`, or no valid `PAYMENT-REQUIRED` header).
 - `name` and `website` are optional. Without them we use your `serviceName` and the endpoint's origin.
+
+**Nothing is written before your 402 proves it.** This endpoint is unauthenticated — anyone can POST to it, and there is no way for us to establish that a caller controls the address it claims. So the endpoint itself is the proof: a registration that does not verify creates no listing, changes no listing, and leaves your `name` and `website` untouched. The same rule protects you in the other direction — a stranger cannot register your URL under their own address and take your listing, because yours is already verified.
 
 ## 3. Discover a merchant's endpoints
 

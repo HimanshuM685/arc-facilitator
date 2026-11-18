@@ -5,14 +5,29 @@
  */
 
 import { NextResponse, type NextRequest } from "next/server";
+import { isAddress } from "viem";
 import type { PaymentPayload, PaymentRequirements } from "@x402/core/types";
 import { networkKeyForCaip2 } from "./facilitator";
 import { clientIp, type PreflightResult } from "./guards";
 import { NETWORK_KEYS, NETWORKS, type NetworkKey } from "./networks";
 
 type Parsed =
-  | { net: NetworkKey; payload: PaymentPayload; requirements: PaymentRequirements; ip: string }
+  | { net: NetworkKey; payload: PaymentPayload; requirements: PaymentRequirements; ip: string; payer?: string }
   | { error: NextResponse };
+
+/**
+ * The payer address a payload claims, for rate-limit bucketing.
+ *
+ * It is the claim and not yet the recovered signer — @x402/evm does the recovery
+ * later. That is enough for a counter: `from` is part of the EIP-712 message, so
+ * a payload that names someone else's address cannot settle, and the limit is
+ * there to stop one account draining the gas wallet. Anything that is not an
+ * address is left unbucketed rather than used as a key.
+ */
+export function payerOf(payload: PaymentPayload): string | undefined {
+  const from = (payload as { payload?: { authorization?: { from?: unknown } } }).payload?.authorization?.from;
+  return typeof from === "string" && isAddress(from) ? from : undefined;
+}
 
 const badRequest = (message: string) =>
   NextResponse.json({ error: "bad_request", message }, { status: 400 });
@@ -63,7 +78,7 @@ export async function parseFacilitatorRequest(request: NextRequest): Promise<Par
     };
   }
 
-  return { net, payload, requirements, ip: clientIp(request.headers) };
+  return { net, payload, requirements, ip: clientIp(request.headers), payer: payerOf(payload) };
 }
 
 /**
